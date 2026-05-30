@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cian-rent-alerts"
+version = "0.1.0"
+description = "MVP service that watches CIAN rental listings and sends Telegram alerts."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "APScheduler>=3.10,<4",
+    "beautifulsoup4>=4.12,<5",
+    "cloudscraper>=1.2,<2",
+    "python-telegram-bot>=21,<22",
+    "requests>=2.31,<3",
+]
+
+[project.optional-dependencies]
+playwright = ["playwright>=1.45,<2"]
+dev = ["pytest>=8,<9", "ruff>=0.6,<1"]
+
+[project.scripts]
+cian-rent-alerts = "cian_rent_alerts.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

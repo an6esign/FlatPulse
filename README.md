@@ -396,6 +396,64 @@ HTML для диагностики сохраняется в volume `debug_pages
 - HTML из `debug_pages`;
 - Telegram token, Postgres password и chat id пользователей.
 
+## Server Deploy
+
+Для первого VPS достаточно Docker Compose как оркестратора: один `bot`, один
+`worker`, один `postgres`. Не запускайте параллельно локальный
+`.venv/bin/cian-rent-alerts` с тем же Telegram token.
+
+Рекомендуемый каталог на сервере:
+
+```bash
+/opt/flatpulse
+```
+
+Первичная установка:
+
+```bash
+git clone https://github.com/an6esign/FlatPulse.git /opt/flatpulse
+cd /opt/flatpulse
+cp .env.example .env
+```
+
+Заполните `.env` реальными секретами на сервере. Файл `.env` не должен попадать в
+git, backup-архивы или публичные логи.
+
+Первый запуск:
+
+```bash
+docker compose config --quiet
+docker compose run --rm migrate
+docker compose up -d bot worker
+docker compose ps
+```
+
+Обновление сервера:
+
+```bash
+sh deploy/update.sh
+```
+
+Пример systemd unit лежит в `deploy/flatpulse.service.example`. Перед установкой
+проверьте `WorkingDirectory` и путь к `docker` на вашем сервере:
+
+```bash
+sudo cp deploy/flatpulse.service.example /etc/systemd/system/flatpulse.service
+sudo systemctl daemon-reload
+sudo systemctl enable flatpulse
+sudo systemctl start flatpulse
+sudo systemctl status flatpulse
+```
+
+Остановить сервис:
+
+```bash
+sudo systemctl stop flatpulse
+```
+
+После reboot systemd поднимет Docker Compose stack, а `restart: unless-stopped`
+перезапустит отдельные контейнеры при падении процесса.
+
 ## Production Smoke Checklist
 
 Перед деплоем или после обновления на сервере:

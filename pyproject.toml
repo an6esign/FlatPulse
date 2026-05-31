@@ -9,11 +9,14 @@ description = "MVP service that watches CIAN rental listings and sends Telegram 
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "alembic>=1.13,<2",
     "APScheduler>=3.10,<4",
     "beautifulsoup4>=4.12,<5",
     "cloudscraper>=1.2,<2",
     "python-telegram-bot>=21,<22",
+    "psycopg[binary]>=3.2,<4",
     "requests>=2.31,<3",
+    "SQLAlchemy>=2.0,<3",
 ]
 
 [project.optional-dependencies]

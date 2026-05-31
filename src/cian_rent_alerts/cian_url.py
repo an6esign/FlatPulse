@@ -56,8 +56,10 @@ def build_cian_search_url(
         query.append(("type", "4"))
     elif rent_type == "short":
         query.append(("type", "2"))
+    elif rent_type == "all":
+        pass
     else:
-        raise ConfigError("CIAN_RENT_TYPE must be either 'long' or 'short'")
+        raise ConfigError("CIAN_RENT_TYPE must be 'long', 'short', or 'all'")
 
     for room in rooms:
         room = room.strip().lower()

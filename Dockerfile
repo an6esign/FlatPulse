@@ -7,9 +7,14 @@ WORKDIR /app
 
 COPY pyproject.toml README.md ./
 COPY src ./src
+COPY alembic.ini ./
+COPY migrations ./migrations
+COPY scripts ./scripts
 
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir . \
+    && chmod +x /app/scripts/docker-entrypoint.sh
 
 VOLUME ["/app/data"]
 
+ENTRYPOINT ["/app/scripts/docker-entrypoint.sh"]
 CMD ["cian-rent-alerts"]

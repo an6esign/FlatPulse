@@ -16,10 +16,18 @@ class TelegramNotifier:
         self.chat_id = chat_id
 
     async def send_listing(self, listing: Listing) -> None:
+        await self.send_message(listing.format_message(), disable_web_page_preview=False)
+
+    async def send_message(
+        self,
+        text: str,
+        *,
+        disable_web_page_preview: bool = True,
+    ) -> None:
         await self.bot.send_message(
             chat_id=self.chat_id,
-            text=listing.format_message(),
-            disable_web_page_preview=False,
+            text=text,
+            disable_web_page_preview=disable_web_page_preview,
         )
 
     async def send_listings(self, listings: list[Listing]) -> list[str]:
@@ -34,3 +42,7 @@ class TelegramNotifier:
 
 def send_listings_sync(notifier: TelegramNotifier, listings: list[Listing]) -> list[str]:
     return asyncio.run(notifier.send_listings(listings))
+
+
+def send_message_sync(notifier: TelegramNotifier, text: str) -> None:
+    asyncio.run(notifier.send_message(text))

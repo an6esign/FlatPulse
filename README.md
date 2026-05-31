@@ -1,6 +1,6 @@
 # CIAN Rent Alerts
 
-MVP-сервис на Python, который проверяет страницу поиска аренды на ЦИАН, сохраняет найденные объявления в SQLite и отправляет новые варианты в Telegram.
+MVP-сервис на Python, который проверяет страницу поиска аренды на ЦИАН, сохраняет найденные объявления в SQLite или PostgreSQL и отправляет новые варианты в Telegram.
 
 ## Что умеет
 
@@ -46,9 +46,10 @@ CIAN_MAX_PRICE=45000
 CIAN_RENT_TYPE=long
 CIAN_SORT_BY=creation_date_from_newer_to_older
 CIAN_POLYGON=
+CIAN_AREA_LABEL=
 ```
 
-Затем укажите `TELEGRAM_BOT_TOKEN` и `TELEGRAM_CHAT_ID`.
+Затем укажите `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` и `ADMIN_TELEGRAM_IDS`.
 
 Если нужна полностью ручная ссылка, выставьте:
 
@@ -63,13 +64,31 @@ CIAN_SEARCH_URL=https://cian.ru/cat.php?...
 cian-rent-alerts --once
 ```
 
+Быстро проверить только парсер без БД, Telegram и scheduler:
+
+```bash
+cian-rent-alerts --parser-smoke
+```
+
+Проверить доступность БД и примененную схему:
+
+```bash
+cian-rent-alerts --healthcheck
+```
+
 5. Запустите постоянную проверку:
 
 ```bash
 cian-rent-alerts
 ```
 
-По умолчанию проверка идет каждые 10 минут. Интервал задается через `CHECK_INTERVAL_SECONDS`.
+По умолчанию проверка идет каждые 10 минут. Интервал задается через
+`CHECK_INTERVAL_SECONDS`. Между проверками разных пользовательских поисков worker
+делает паузу `SEARCH_CHECK_DELAY_SECONDS`, чтобы не отправлять много запросов к
+ЦИАН подряд.
+
+Уровень логирования задается через `LOG_LEVEL`. По умолчанию используется `INFO`,
+для подробной диагностики можно поставить `DEBUG` или запустить CLI с `--verbose`.
 
 При постоянном запуске сервис одновременно:
 
@@ -86,7 +105,7 @@ cian-rent-alerts
 /settings
 ```
 
-Открыть кнопочное меню и показать текущие фильтры. В меню есть кнопки для города, комнат, цены, типа аренды, области поиска, сортировки, ручной ссылки, проверки сейчас и режима "только новые". В каждом разделе есть кнопка `Ввести вручную`, которая показывает нужную команду для точного значения.
+Открыть кнопочное меню или показать текущие фильтры. В меню есть кнопки для города, комнат, цены, типа аренды, области поиска, сортировки, ручной ссылки, проверки сейчас и режима "только новые". В каждом разделе есть кнопка `Ввести вручную`, которая показывает нужную команду для точного значения.
 
 ```text
 /search_url
@@ -132,6 +151,20 @@ cian-rent-alerts
 
 Кнопка `Только новые` делает то же самое, что и `/mark_existing_sent`: текущая выдача остается в базе, но не отправляется в Telegram. После этого сервис будет присылать только объявления, которые появятся позже.
 
+## Админские команды
+
+Админские команды доступны только chat id из `ADMIN_TELEGRAM_IDS`:
+
+```text
+/admin_status
+/admin_health
+/admin_report
+/admin_last_runs
+/admin_errors
+```
+
+Они показывают состояние БД, миграций, внутренних проверок, последние запуски и последние ошибки. Эти команды предназначены для мониторинга и не показываются обычным пользователям в меню.
+
 ## Dry-run
 
 Чтобы проверить парсинг без Telegram, включите в `.env`:
@@ -157,6 +190,91 @@ playwright install chromium
 USE_PLAYWRIGHT=true
 ```
 
+Если нужно сначала пробовать обычный Requests-парсер, а Playwright использовать только
+при `captcha` или `empty_parse`, включите fallback:
+
+```env
+PLAYWRIGHT_FALLBACK=true
+```
+
+При `USE_PLAYWRIGHT=true` сервис сразу использует Playwright и fallback не нужен.
+
+## Диагностика парсинга
+
+Для временных сетевых ошибок сервис повторяет запрос перед тем, как считать проверку
+сломавшейся:
+
+```env
+PARSER_RETRY_ATTEMPTS=2
+PARSER_RETRY_BACKOFF_SECONDS=2
+```
+
+Retry применяется к сетевым ошибкам и таймаутам. `captcha` и `empty_parse` не
+повторяются бесконечно: для них используется Playwright fallback, если он включен.
+
+Если отдельный поиск продолжает падать, сервис временно ставит на паузу только
+этот поиск:
+
+```env
+PARSER_PROBLEM_COOLDOWN_SECONDS=3600
+PARSER_NETWORK_COOLDOWN_SECONDS=900
+```
+
+`PARSER_PROBLEM_COOLDOWN_SECONDS` применяется для `captcha` и `empty_parse`,
+`PARSER_NETWORK_COOLDOWN_SECONDS` - для сетевых ошибок после retry.
+
+При `captcha` или `empty_parse` сервис сохраняет HTML страницы для диагностики:
+
+```env
+PARSER_DEBUG_DIR=data/debug_pages
+```
+
+В Docker эти файлы хранятся в volume `debug_pages`. Они помогают понять, что именно вернул ЦИАН: капчу, пустую выдачу или измененную разметку.
+
+## База данных
+
+В продовом Docker Compose используется PostgreSQL:
+
+```env
+POSTGRES_DB=flatpulse
+POSTGRES_USER=flatpulse
+POSTGRES_PASSWORD=replace_with_strong_password
+```
+
+Для локальной разработки можно не задавать `DATABASE_URL`; тогда сервис использует SQLite из `DATABASE_PATH`. В Docker Compose `DATABASE_URL` собирается из `POSTGRES_DB`, `POSTGRES_USER` и `POSTGRES_PASSWORD`, поэтому пароль не хранится в `docker-compose.yml`.
+
+Схема БД версионируется через Alembic. В Docker миграции запускаются автоматически перед стартом приложения:
+
+```env
+RUN_MIGRATIONS=true
+```
+
+Для ручного запуска миграций:
+
+```bash
+.venv/bin/alembic upgrade head
+```
+
+`ListingStore.init()` пока остается как локальная страховка для SQLite и тестов, но для продового PostgreSQL основным путем должен быть `alembic upgrade head`.
+
+Если SQLite-база уже была создана до появления Alembic, не удаляйте `data/listings.sqlite3`: там могут быть пользователи, поиски и уже найденные объявления. Сначала отметьте текущую схему как baseline, затем примените новые миграции:
+
+```bash
+.venv/bin/alembic stamp 20260530_0001
+.venv/bin/alembic upgrade head
+.venv/bin/alembic current
+```
+
+`stamp` нужен только для старой уже существующей базы. Для новой пустой базы достаточно `.venv/bin/alembic upgrade head`.
+
+Текущий пользовательский сценарий пока работает как один активный поиск, но схема БД уже содержит основу для публичного мультипользовательского режима:
+
+- `users` - пользователи Telegram;
+- `searches` - сохраненные поиски пользователей;
+- `search_seen_listings` - дедупликация объявлений на уровне конкретного поиска;
+- `listings` - общий каталог найденных объявлений;
+- `check_runs` - история технических проверок для мониторинга.
+
 ## Docker
 
 ```bash
@@ -164,7 +282,108 @@ cp .env.example .env
 docker compose up --build -d
 ```
 
-SQLite-файл хранится в `./data/listings.sqlite3`.
+Перед запуском заполните в `.env` реальные значения:
+
+```env
+TELEGRAM_BOT_TOKEN=...
+ADMIN_TELEGRAM_IDS=...
+POSTGRES_DB=flatpulse
+POSTGRES_USER=flatpulse
+POSTGRES_PASSWORD=...
+```
+
+`docker-compose.yml` не хранит пароль Postgres и собирает `DATABASE_URL` из этих переменных. Сам файл `.env` не должен попадать в git или Docker build context.
+
+PostgreSQL-данные хранятся в Docker volume `postgres_data`. В Docker Compose приложение разделено на процессы:
+
+- `migrate` - применяет Alembic-миграции и завершается;
+- `bot` - слушает Telegram polling;
+- `worker` - выполняет проверки по расписанию.
+
+`bot` и `worker` стартуют только после успешного завершения `migrate` и используют одну PostgreSQL-базу.
+Для `bot` и `worker` настроен Docker healthcheck через `cian-rent-alerts --healthcheck`.
+
+Посмотреть логи:
+
+```bash
+docker compose logs -f migrate bot worker
+```
+
+## Production Smoke Checklist
+
+Перед деплоем или после обновления на сервере:
+
+1. Проверьте, что `.env` заполнен реальными значениями и не содержит placeholder-паролей:
+
+```bash
+docker compose --env-file .env config --quiet
+```
+
+2. Примените миграции:
+
+```bash
+docker compose run --rm migrate
+```
+
+3. Проверьте парсер без Telegram, scheduler и рассылок:
+
+```bash
+docker compose run --rm bot cian-rent-alerts --parser-smoke
+```
+
+4. Проверьте БД и миграции:
+
+```bash
+docker compose run --rm bot cian-rent-alerts --healthcheck
+```
+
+5. Запустите сервисы:
+
+```bash
+docker compose up -d bot worker
+```
+
+6. Проверьте логи старта:
+
+```bash
+docker compose logs -f --tail=100 bot worker
+```
+
+7. В Telegram от админского аккаунта проверьте:
+
+```text
+/admin_health
+/admin_status
+```
+
+Ожидаемо: `DB: ok`, актуальная schema version, worker без постоянных `captcha`,
+`empty_parse` или `network` ошибок.
+
+## Backup и Restore
+
+Создать backup PostgreSQL:
+
+```bash
+docker compose --profile ops run --rm backup
+```
+
+Backup сохраняется в Docker volume `backups` как файл вида `flatpulse_YYYYmmdd_HHMMSS.dump`.
+
+Посмотреть список backup-файлов:
+
+```bash
+docker compose --profile ops run --rm backup sh -c 'ls -lh /backups'
+```
+
+Восстановить backup:
+
+```bash
+docker compose stop bot worker
+BACKUP_FILE=flatpulse_YYYYmmdd_HHMMSS.dump docker compose --profile ops run --rm restore
+docker compose up -d bot worker
+```
+
+Restore выполняет `pg_restore --clean --if-exists`: текущие таблицы будут перезаписаны данными из backup. Перед восстановлением убедитесь, что выбран правильный файл.
 
 ## Важные замечания
 

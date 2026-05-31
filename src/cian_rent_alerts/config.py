@@ -64,6 +64,18 @@ def _as_rooms(value: str | None) -> tuple[str, ...]:
     return tuple(part.strip() for part in value.split(",") if part.strip())
 
 
+def _as_csv_set(value: str | None) -> frozenset[str]:
+    if value is None or value.strip() == "":
+        return frozenset()
+    return frozenset(part.strip() for part in value.split(",") if part.strip())
+
+
+def _as_optional_path(value: str | None) -> Path | None:
+    if value is None or value.strip() == "":
+        return None
+    return Path(value)
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     cian_search_url: str | None
@@ -79,13 +91,23 @@ class Settings:
     cian_area_label: str | None
     telegram_bot_token: str | None
     telegram_chat_id: str | None
+    admin_telegram_ids: frozenset[str]
+    database_url: str | None
     database_path: Path
+    parser_debug_dir: Path | None
     check_interval_seconds: int
+    search_check_delay_seconds: int
     listing_limit: int
+    listing_max_age_days: int
     dry_run: bool
     request_timeout_seconds: int
+    parser_retry_attempts: int
+    parser_retry_backoff_seconds: int
+    parser_problem_cooldown_seconds: int
+    parser_network_cooldown_seconds: int
     user_agent: str
     use_playwright: bool
+    playwright_fallback: bool
     playwright_headless: bool
 
     @classmethod
@@ -109,17 +131,29 @@ class Settings:
             cian_area_label=os.getenv("CIAN_AREA_LABEL") or None,
             telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN"),
             telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID"),
+            admin_telegram_ids=_as_csv_set(os.getenv("ADMIN_TELEGRAM_IDS")),
+            database_url=os.getenv("DATABASE_URL") or None,
             database_path=Path(os.getenv("DATABASE_PATH", "data/listings.sqlite3")),
+            parser_debug_dir=_as_optional_path(os.getenv("PARSER_DEBUG_DIR")),
             check_interval_seconds=max(_as_int("CHECK_INTERVAL_SECONDS", 600), 60),
+            search_check_delay_seconds=max(_as_int("SEARCH_CHECK_DELAY_SECONDS", 5), 0),
             listing_limit=max(_as_int("LISTING_LIMIT", 50), 1),
+            listing_max_age_days=max(_as_int("LISTING_MAX_AGE_DAYS", 2), 0),
             dry_run=_as_bool(os.getenv("DRY_RUN"), False),
             request_timeout_seconds=max(_as_int("REQUEST_TIMEOUT_SECONDS", 20), 1),
+            parser_retry_attempts=max(_as_int("PARSER_RETRY_ATTEMPTS", 2), 1),
+            parser_retry_backoff_seconds=max(_as_int("PARSER_RETRY_BACKOFF_SECONDS", 2), 0),
+            parser_problem_cooldown_seconds=max(
+                _as_int("PARSER_PROBLEM_COOLDOWN_SECONDS", 3600), 0
+            ),
+            parser_network_cooldown_seconds=max(_as_int("PARSER_NETWORK_COOLDOWN_SECONDS", 900), 0),
             user_agent=os.getenv(
                 "USER_AGENT",
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36",
             ),
             use_playwright=_as_bool(os.getenv("USE_PLAYWRIGHT"), False),
+            playwright_fallback=_as_bool(os.getenv("PLAYWRIGHT_FALLBACK"), False),
             playwright_headless=_as_bool(os.getenv("PLAYWRIGHT_HEADLESS"), True),
         )
 

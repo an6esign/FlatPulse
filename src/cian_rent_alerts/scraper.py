@@ -5,6 +5,8 @@ import logging
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
+from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
 
@@ -20,6 +22,11 @@ LISTING_URL_RE = re.compile(r"https?://(?:[\w-]+\.)?cian\.ru/rent/flat/(\d+)/?")
 RELATIVE_LISTING_URL_RE = re.compile(r"/rent/flat/(\d+)/?")
 PRICE_RE = re.compile(r"(\d[\d\s]{2,})\s*(?:₽|руб\.?|р\b)")
 ROOMS_RE = re.compile(r"((?:\d+)-комн\.?|студия|студии)", re.IGNORECASE)
+_CAPTCHA_MESSAGE = (
+    "CIAN returned a captcha/access-check page instead of listings. "
+    "The service cannot parse listings from this response."
+)
+_MAX_DEBUG_HTML_BYTES = 1_000_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,6 +35,23 @@ class ScraperConfig:
     user_agent: str
     timeout_seconds: int
     limit: int
+    debug_dir: Path | None = None
+
+
+class CianScraperError(RuntimeError):
+    pass
+
+
+class CaptchaError(CianScraperError):
+    pass
+
+
+class NetworkFetchError(CianScraperError):
+    pass
+
+
+class EmptyParseError(CianScraperError):
+    pass
 
 
 class CianScraper:
@@ -66,6 +90,7 @@ class CianScraper:
 
             seen.add(cian_id)
             card_text = _compact_text(card.get_text(" ", strip=True))
+            published = _extract_published_info(card_text)
             title = _first_text(
                 card.select("div[data-name='GeneralInfoSectionRowComponent']"),
                 fallback=_guess_title(_compact_text(link.get_text(" ", strip=True)), card_text),
@@ -77,7 +102,7 @@ class CianScraper:
                 price=_extract_cian_card_price(card) or _guess_price(card_text),
                 address=_extract_cian_card_address(card) or _guess_address(card_text),
                 rooms=_guess_rooms(title or card_text),
-                raw={"source": "cian_card"},
+                raw={"source": "cian_card", **published},
             )
 
     def _from_json_ld(self, soup: BeautifulSoup) -> Iterable[Listing]:
@@ -104,6 +129,7 @@ class CianScraper:
             card_text = _compact_text(card.get_text(" ", strip=True) if card else "")
             anchor_text = _compact_text(anchor.get_text(" ", strip=True))
             text = card_text or anchor_text
+            published = _extract_published_info(text)
 
             seen.add(cian_id)
             yield Listing(
@@ -113,7 +139,7 @@ class CianScraper:
                 price=_guess_price(text),
                 address=_guess_address(text),
                 rooms=_guess_rooms(text),
-                raw={"source": "html"},
+                raw={"source": "html", **published},
             )
 
 
@@ -144,12 +170,15 @@ class RequestsCianScraper(CianScraper):
             )
             response.raise_for_status()
         except requests.RequestException as exc:
-            raise RuntimeError(f"Failed to fetch CIAN search page: {exc}") from exc
+            raise NetworkFetchError(f"Failed to fetch CIAN search page: {exc}") from exc
         if _looks_like_access_check(response.text):
-            raise RuntimeError(
-                "CIAN returned a captcha/access-check page instead of listings. "
-                "The service cannot parse listings from this response."
+            _save_debug_html(
+                response.text,
+                self.config.debug_dir,
+                reason="captcha",
+                search_url=self.config.search_url,
             )
+            raise CaptchaError(_CAPTCHA_MESSAGE)
         return response.text
 
 
@@ -174,10 +203,13 @@ class PlaywrightCianScraper(CianScraper):
             html = page.content()
             browser.close()
         if _looks_like_access_check(html):
-            raise RuntimeError(
-                "CIAN returned a captcha/access-check page instead of listings. "
-                "The service cannot parse listings from this response."
+            _save_debug_html(
+                html,
+                self.config.debug_dir,
+                reason="captcha",
+                search_url=self.config.search_url,
             )
+            raise CaptchaError(_CAPTCHA_MESSAGE)
         return html
 
 
@@ -185,7 +217,12 @@ def scrape(scraper: CianScraper, limit: int) -> list[Listing]:
     html = scraper.fetch()
     listings = scraper.parse(html)
     if not listings:
+        config = getattr(scraper, "config", None)
+        debug_dir = getattr(config, "debug_dir", None)
+        search_url = getattr(config, "search_url", "unknown")
+        _save_debug_html(html, debug_dir, reason="empty_parse", search_url=search_url)
         logger.warning("No listings found on the page")
+        raise EmptyParseError("No listings found on the page")
     return listings[:limit]
 
 
@@ -210,6 +247,7 @@ def _walk_json_for_listings(payload: Any) -> Iterable[Listing]:
         if cian_id:
             offers = payload.get("offers") if isinstance(payload.get("offers"), dict) else {}
             address = payload.get("address")
+            published = _published_info_from_json(payload)
             if isinstance(address, dict):
                 address = address.get("streetAddress") or address.get("addressLocality")
             yield Listing(
@@ -219,7 +257,7 @@ def _walk_json_for_listings(payload: Any) -> Iterable[Listing]:
                 price=_parse_int(offers.get("price")) if offers else None,
                 address=address if isinstance(address, str) else None,
                 rooms=_guess_rooms(str(payload.get("name", ""))),
-                raw={"source": "json_ld"},
+                raw={"source": "json_ld", **published},
             )
 
     for value in payload.values():
@@ -333,6 +371,39 @@ def _parse_int(value: Any) -> int | None:
     return int(digits) if digits else None
 
 
+def _published_info_from_json(payload: dict[str, Any]) -> dict[str, str]:
+    value = payload.get("datePublished") or payload.get("datePosted") or payload.get("dateCreated")
+    if not isinstance(value, str) or not value.strip():
+        return {}
+    return {"published_at": value[:10], "published_label": value}
+
+
+def _extract_published_info(text: str) -> dict[str, str]:
+    lowered = text.lower()
+    today = date.today()
+
+    if "сегодня" in lowered:
+        return _published_info(today, "сегодня")
+    if "позавчера" in lowered:
+        return _published_info(today - timedelta(days=2), "позавчера")
+    if "вчера" in lowered:
+        return _published_info(today - timedelta(days=1), "вчера")
+
+    match = re.search(r"(\d+)\s*(?:день|дня|дней)\s+назад", lowered)
+    if match:
+        days = int(match.group(1))
+        return _published_info(today - timedelta(days=days), match.group(0))
+
+    if re.search(r"(\d+)\s*(?:час|часа|часов|минут[а-я]*)\s+назад", lowered):
+        return _published_info(today, "сегодня")
+
+    return {}
+
+
+def _published_info(value: date, label: str) -> dict[str, str]:
+    return {"published_at": value.isoformat(), "published_label": label}
+
+
 def _merge_listing(primary: Listing, secondary: Listing) -> Listing:
     return Listing(
         cian_id=primary.cian_id,
@@ -343,6 +414,32 @@ def _merge_listing(primary: Listing, secondary: Listing) -> Listing:
         rooms=primary.rooms or secondary.rooms,
         raw={**secondary.raw, **primary.raw},
     )
+
+
+def _save_debug_html(
+    html: str,
+    debug_dir: Path | None,
+    *,
+    reason: str,
+    search_url: str,
+) -> Path | None:
+    if debug_dir is None:
+        return None
+
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S_%f")
+    filename = f"{timestamp}_{_safe_filename_part(reason)}.html"
+    path = debug_dir / filename
+    header = f"<!-- reason={reason} url={search_url} -->\n"
+    payload = (header + html)[:_MAX_DEBUG_HTML_BYTES]
+    path.write_text(payload, encoding="utf-8")
+    logger.info("Saved CIAN debug HTML to %s", path)
+    return path
+
+
+def _safe_filename_part(value: str) -> str:
+    normalized = re.sub(r"[^a-zA-Z0-9_-]+", "_", value.strip())
+    return normalized.strip("_") or "debug"
 
 
 def _looks_like_access_check(html: str) -> bool:

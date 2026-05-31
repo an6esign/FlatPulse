@@ -1,10 +1,30 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Iterable
+
+from sqlalchemy import (
+    Boolean,
+    Column,
+    ForeignKey,
+    Index,
+    Integer,
+    MetaData,
+    String,
+    Table,
+    Text,
+    case,
+    func,
+    create_engine,
+    delete,
+    insert,
+    select,
+    text,
+    update,
+)
+from sqlalchemy.exc import SQLAlchemyError
 
 from .models import Listing
 
@@ -13,149 +33,793 @@ def utc_now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
 
 
-class ListingStore:
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+metadata = MetaData()
 
-    def connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path)
-        conn.row_factory = sqlite3.Row
-        return conn
+listings_table = Table(
+    "listings",
+    metadata,
+    Column("cian_id", Text, primary_key=True),
+    Column("url", Text, nullable=False),
+    Column("title", Text),
+    Column("price", Integer),
+    Column("address", Text),
+    Column("rooms", Text),
+    Column("raw_json", Text, nullable=False, default="{}"),
+    Column("first_seen_at", String(40), nullable=False),
+    Column("last_seen_at", String(40), nullable=False),
+    Column("sent_at", String(40)),
+)
+Index("idx_listings_sent_at", listings_table.c.sent_at)
+
+app_settings_table = Table(
+    "app_settings",
+    metadata,
+    Column("key", Text, primary_key=True),
+    Column("value", Text, nullable=False),
+    Column("updated_at", String(40), nullable=False),
+)
+
+check_runs_table = Table(
+    "check_runs",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("started_at", String(40), nullable=False),
+    Column("finished_at", String(40)),
+    Column("status", Text, nullable=False),
+    Column("listings_found", Integer, nullable=False, default=0),
+    Column("listings_saved", Integer, nullable=False, default=0),
+    Column("new_listings", Integer, nullable=False, default=0),
+    Column("notifications_sent", Integer, nullable=False, default=0),
+    Column("error", Text),
+)
+Index("idx_check_runs_started_at", check_runs_table.c.started_at)
+
+users_table = Table(
+    "users",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("telegram_chat_id", Text, nullable=False, unique=True),
+    Column("telegram_user_id", Text),
+    Column("username", Text),
+    Column("first_seen_at", String(40), nullable=False),
+    Column("last_seen_at", String(40), nullable=False),
+    Column("is_admin", Boolean, nullable=False, default=False),
+    Column("is_active", Boolean, nullable=False, default=True),
+)
+Index("idx_users_telegram_chat_id", users_table.c.telegram_chat_id)
+
+user_states_table = Table(
+    "user_states",
+    metadata,
+    Column("user_id", Integer, ForeignKey("users.id"), primary_key=True),
+    Column("state_key", Text, primary_key=True),
+    Column("state_value", Text, nullable=False),
+    Column("updated_at", String(40), nullable=False),
+)
+Index("idx_user_states_user_id", user_states_table.c.user_id)
+
+searches_table = Table(
+    "searches",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("user_id", Integer, ForeignKey("users.id"), nullable=False),
+    Column("title", Text, nullable=False),
+    Column("city", Text, nullable=False),
+    Column("region_id", Text),
+    Column("rooms", Text, nullable=False),
+    Column("min_price", Integer),
+    Column("max_price", Integer),
+    Column("rent_type", Text, nullable=False),
+    Column("sort_by", Text, nullable=False),
+    Column("polygon", Text),
+    Column("area_label", Text),
+    Column("manual_url", Text),
+    Column("use_generated_url", Boolean, nullable=False, default=True),
+    Column("is_active", Boolean, nullable=False, default=True),
+    Column("last_error_type", Text),
+    Column("last_error_at", String(40)),
+    Column("cooldown_until", String(40)),
+    Column("created_at", String(40), nullable=False),
+    Column("updated_at", String(40), nullable=False),
+)
+Index("idx_searches_user_active", searches_table.c.user_id, searches_table.c.is_active)
+Index("idx_searches_cooldown_until", searches_table.c.cooldown_until)
+
+search_seen_listings_table = Table(
+    "search_seen_listings",
+    metadata,
+    Column("search_id", Integer, ForeignKey("searches.id"), primary_key=True),
+    Column("cian_id", Text, ForeignKey("listings.cian_id"), primary_key=True),
+    Column("first_seen_at", String(40), nullable=False),
+    Column("sent_at", String(40)),
+)
+Index("idx_search_seen_sent_at", search_seen_listings_table.c.sent_at)
+
+
+class ListingStore:
+    def __init__(self, path: Path, database_url: str | None = None) -> None:
+        self.path = path
+        self.database_url = build_database_url(path, database_url)
+        self.engine = create_engine(self.database_url, future=True, pool_pre_ping=True)
 
     def init(self) -> None:
-        with self.connect() as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS listings (
-                    cian_id TEXT PRIMARY KEY,
-                    url TEXT NOT NULL,
-                    title TEXT,
-                    price INTEGER,
-                    address TEXT,
-                    rooms TEXT,
-                    raw_json TEXT NOT NULL DEFAULT '{}',
-                    first_seen_at TEXT NOT NULL,
-                    last_seen_at TEXT NOT NULL,
-                    sent_at TEXT
-                )
-                """
-            )
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_listings_sent_at ON listings(sent_at)")
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS app_settings (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                )
-                """
-            )
+        metadata.create_all(self.engine)
 
     def upsert_many(self, listings: Iterable[Listing]) -> int:
         now = utc_now()
         rows = list(listings)
-        with self.connect() as conn:
+        with self.engine.begin() as conn:
             for listing in rows:
-                conn.execute(
-                    """
-                    INSERT INTO listings (
-                        cian_id, url, title, price, address, rooms, raw_json,
-                        first_seen_at, last_seen_at
+                payload = {
+                    "cian_id": listing.cian_id,
+                    "url": listing.url,
+                    "title": listing.title,
+                    "price": listing.price,
+                    "address": listing.address,
+                    "rooms": listing.rooms,
+                    "raw_json": json.dumps(listing.raw, ensure_ascii=False),
+                    "last_seen_at": now,
+                }
+                exists = conn.execute(
+                    select(listings_table.c.cian_id).where(
+                        listings_table.c.cian_id == listing.cian_id
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(cian_id) DO UPDATE SET
-                        url = excluded.url,
-                        title = excluded.title,
-                        price = excluded.price,
-                        address = excluded.address,
-                        rooms = excluded.rooms,
-                        raw_json = excluded.raw_json,
-                        last_seen_at = excluded.last_seen_at
-                    """,
-                    (
-                        listing.cian_id,
-                        listing.url,
-                        listing.title,
-                        listing.price,
-                        listing.address,
-                        listing.rooms,
-                        json.dumps(listing.raw, ensure_ascii=False),
-                        now,
-                        now,
-                    ),
-                )
+                ).first()
+                if exists:
+                    conn.execute(
+                        update(listings_table)
+                        .where(listings_table.c.cian_id == listing.cian_id)
+                        .values(**payload)
+                    )
+                else:
+                    conn.execute(
+                        insert(listings_table).values(
+                            **payload,
+                            first_seen_at=now,
+                        )
+                    )
         return len(rows)
 
     def unsent(self, limit: int) -> list[Listing]:
-        with self.connect() as conn:
+        with self.engine.begin() as conn:
             rows = conn.execute(
-                """
-                SELECT cian_id, url, title, price, address, rooms, raw_json
-                FROM listings
-                WHERE sent_at IS NULL
-                ORDER BY first_seen_at ASC
-                LIMIT ?
-                """,
-                (limit,),
+                select(
+                    listings_table.c.cian_id,
+                    listings_table.c.url,
+                    listings_table.c.title,
+                    listings_table.c.price,
+                    listings_table.c.address,
+                    listings_table.c.rooms,
+                    listings_table.c.raw_json,
+                )
+                .where(listings_table.c.sent_at.is_(None))
+                .order_by(listings_table.c.first_seen_at.asc())
+                .limit(limit)
             ).fetchall()
 
-        return [self._row_to_listing(row) for row in rows]
+        return [self._row_to_listing(dict(row._mapping)) for row in rows]
 
     def mark_sent(self, cian_id: str) -> None:
-        with self.connect() as conn:
+        with self.engine.begin() as conn:
             conn.execute(
-                "UPDATE listings SET sent_at = ? WHERE cian_id = ?",
-                (utc_now(), cian_id),
+                update(listings_table)
+                .where(listings_table.c.cian_id == cian_id)
+                .values(sent_at=utc_now())
             )
 
     def mark_all_unsent_as_sent(self) -> int:
-        now = utc_now()
-        with self.connect() as conn:
-            cursor = conn.execute(
-                "UPDATE listings SET sent_at = ? WHERE sent_at IS NULL",
-                (now,),
+        with self.engine.begin() as conn:
+            result = conn.execute(
+                update(listings_table)
+                .where(listings_table.c.sent_at.is_(None))
+                .values(sent_at=utc_now())
             )
-            return cursor.rowcount
+            return result.rowcount or 0
 
     def get_runtime_settings(self) -> dict[str, str]:
-        with self.connect() as conn:
-            rows = conn.execute("SELECT key, value FROM app_settings").fetchall()
-        return {row["key"]: row["value"] for row in rows}
+        with self.engine.begin() as conn:
+            rows = conn.execute(
+                select(app_settings_table.c.key, app_settings_table.c.value)
+            ).fetchall()
+        return {row._mapping["key"]: row._mapping["value"] for row in rows}
 
     def set_runtime_setting(self, key: str, value: str) -> None:
-        with self.connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO app_settings (key, value, updated_at)
-                VALUES (?, ?, ?)
-                ON CONFLICT(key) DO UPDATE SET
-                    value = excluded.value,
-                    updated_at = excluded.updated_at
-                """,
-                (key, value, utc_now()),
-            )
+        now = utc_now()
+        with self.engine.begin() as conn:
+            exists = conn.execute(
+                select(app_settings_table.c.key).where(app_settings_table.c.key == key)
+            ).first()
+            if exists:
+                conn.execute(
+                    update(app_settings_table)
+                    .where(app_settings_table.c.key == key)
+                    .values(value=value, updated_at=now)
+                )
+            else:
+                conn.execute(
+                    insert(app_settings_table).values(key=key, value=value, updated_at=now)
+                )
 
     def delete_runtime_setting(self, key: str) -> None:
-        with self.connect() as conn:
-            conn.execute("DELETE FROM app_settings WHERE key = ?", (key,))
+        with self.engine.begin() as conn:
+            conn.execute(delete(app_settings_table).where(app_settings_table.c.key == key))
 
     def clear_runtime_settings(self) -> None:
-        with self.connect() as conn:
-            conn.execute("DELETE FROM app_settings")
+        with self.engine.begin() as conn:
+            conn.execute(delete(app_settings_table))
+
+    def ping(self) -> None:
+        with self.engine.begin() as conn:
+            conn.execute(select(1))
+
+    def schema_version(self) -> str | None:
+        try:
+            with self.engine.begin() as conn:
+                value = conn.execute(text("SELECT version_num FROM alembic_version")).scalar()
+        except SQLAlchemyError:
+            return None
+        return str(value) if value is not None else None
+
+    def start_check_run(self) -> int:
+        with self.engine.begin() as conn:
+            result = conn.execute(
+                insert(check_runs_table).values(started_at=utc_now(), status="running")
+            )
+            return int(result.inserted_primary_key[0])
+
+    def finish_check_run(
+        self,
+        run_id: int,
+        *,
+        status: str,
+        listings_found: int = 0,
+        listings_saved: int = 0,
+        new_listings: int = 0,
+        notifications_sent: int = 0,
+        error: str | None = None,
+    ) -> None:
+        with self.engine.begin() as conn:
+            conn.execute(
+                update(check_runs_table)
+                .where(check_runs_table.c.id == run_id)
+                .values(
+                    finished_at=utc_now(),
+                    status=status,
+                    listings_found=listings_found,
+                    listings_saved=listings_saved,
+                    new_listings=new_listings,
+                    notifications_sent=notifications_sent,
+                    error=error,
+                )
+            )
+
+    def last_check_run(self) -> dict[str, object] | None:
+        with self.engine.begin() as conn:
+            row = conn.execute(
+                select(check_runs_table).order_by(check_runs_table.c.started_at.desc()).limit(1)
+            ).first()
+        return dict(row._mapping) if row is not None else None
+
+    def recent_check_runs(self, limit: int = 5) -> list[dict[str, object]]:
+        with self.engine.begin() as conn:
+            rows = conn.execute(
+                select(check_runs_table).order_by(check_runs_table.c.started_at.desc()).limit(limit)
+            ).fetchall()
+        return [dict(row._mapping) for row in rows]
+
+    def recent_failed_check_runs(self, limit: int = 5) -> list[dict[str, object]]:
+        with self.engine.begin() as conn:
+            rows = conn.execute(
+                select(check_runs_table)
+                .where(check_runs_table.c.status == "failed")
+                .order_by(check_runs_table.c.started_at.desc())
+                .limit(limit)
+            ).fetchall()
+        return [dict(row._mapping) for row in rows]
+
+    def check_runs_summary_since(self, since: str) -> dict[str, int]:
+        with self.engine.begin() as conn:
+            row = conn.execute(
+                select(
+                    func.count().label("runs"),
+                    func.coalesce(func.sum(check_runs_table.c.notifications_sent), 0).label(
+                        "notifications_sent"
+                    ),
+                    func.coalesce(
+                        func.sum(
+                            case(
+                                (check_runs_table.c.status == "failed", 1),
+                                else_=0,
+                            )
+                        ),
+                        0,
+                    ).label("failed_runs"),
+                    func.coalesce(
+                        func.sum(
+                            case(
+                                (check_runs_table.c.status == "partial", 1),
+                                else_=0,
+                            )
+                        ),
+                        0,
+                    ).label("partial_runs"),
+                ).where(check_runs_table.c.started_at >= since)
+            ).first()
+        if row is None:
+            return {
+                "runs": 0,
+                "notifications_sent": 0,
+                "failed_runs": 0,
+                "partial_runs": 0,
+            }
+        data = row._mapping
+        return {
+            "runs": int(data["runs"] or 0),
+            "notifications_sent": int(data["notifications_sent"] or 0),
+            "failed_runs": int(data["failed_runs"] or 0),
+            "partial_runs": int(data["partial_runs"] or 0),
+        }
+
+    def upsert_user(
+        self,
+        *,
+        telegram_chat_id: str,
+        telegram_user_id: str | None = None,
+        username: str | None = None,
+        is_admin: bool = False,
+    ) -> int:
+        now = utc_now()
+        with self.engine.begin() as conn:
+            row = conn.execute(
+                select(users_table.c.id).where(users_table.c.telegram_chat_id == telegram_chat_id)
+            ).first()
+            if row is not None:
+                user_id = int(row._mapping["id"])
+                conn.execute(
+                    update(users_table)
+                    .where(users_table.c.id == user_id)
+                    .values(
+                        telegram_user_id=telegram_user_id,
+                        username=username,
+                        last_seen_at=now,
+                        is_admin=is_admin,
+                        is_active=True,
+                    )
+                )
+                return user_id
+
+            result = conn.execute(
+                insert(users_table).values(
+                    telegram_chat_id=telegram_chat_id,
+                    telegram_user_id=telegram_user_id,
+                    username=username,
+                    first_seen_at=now,
+                    last_seen_at=now,
+                    is_admin=is_admin,
+                    is_active=True,
+                )
+            )
+            return int(result.inserted_primary_key[0])
+
+    def get_user_by_chat_id(self, telegram_chat_id: str) -> dict[str, object] | None:
+        with self.engine.begin() as conn:
+            row = conn.execute(
+                select(users_table).where(users_table.c.telegram_chat_id == telegram_chat_id)
+            ).first()
+        return dict(row._mapping) if row is not None else None
+
+    def users_count(self, *, active: bool | None = None) -> int:
+        query = select(func.count()).select_from(users_table)
+        if active is not None:
+            query = query.where(users_table.c.is_active.is_(active))
+        with self.engine.begin() as conn:
+            return int(conn.execute(query).scalar_one())
+
+    def recent_users(self, limit: int = 10) -> list[dict[str, object]]:
+        with self.engine.begin() as conn:
+            rows = conn.execute(
+                select(users_table).order_by(users_table.c.last_seen_at.desc()).limit(limit)
+            ).fetchall()
+        return [dict(row._mapping) for row in rows]
+
+    def get_user_state(self, user_id: int, key: str) -> str | None:
+        with self.engine.begin() as conn:
+            row = conn.execute(
+                select(user_states_table.c.state_value)
+                .where(user_states_table.c.user_id == user_id)
+                .where(user_states_table.c.state_key == key)
+            ).first()
+        if row is None:
+            return None
+        return str(row._mapping["state_value"])
+
+    def set_user_state(self, user_id: int, key: str, value: str) -> None:
+        now = utc_now()
+        with self.engine.begin() as conn:
+            row = conn.execute(
+                select(user_states_table.c.user_id)
+                .where(user_states_table.c.user_id == user_id)
+                .where(user_states_table.c.state_key == key)
+            ).first()
+            if row is not None:
+                conn.execute(
+                    update(user_states_table)
+                    .where(user_states_table.c.user_id == user_id)
+                    .where(user_states_table.c.state_key == key)
+                    .values(state_value=value, updated_at=now)
+                )
+                return
+
+            conn.execute(
+                insert(user_states_table).values(
+                    user_id=user_id,
+                    state_key=key,
+                    state_value=value,
+                    updated_at=now,
+                )
+            )
+
+    def delete_user_state(self, user_id: int, key: str) -> None:
+        with self.engine.begin() as conn:
+            conn.execute(
+                delete(user_states_table)
+                .where(user_states_table.c.user_id == user_id)
+                .where(user_states_table.c.state_key == key)
+            )
+
+    def create_search(
+        self,
+        *,
+        user_id: int,
+        title: str,
+        city: str,
+        region_id: str | None,
+        rooms: tuple[str, ...],
+        min_price: int | None,
+        max_price: int | None,
+        rent_type: str,
+        sort_by: str,
+        polygon: str | None = None,
+        area_label: str | None = None,
+        manual_url: str | None = None,
+        use_generated_url: bool = True,
+        is_active: bool = True,
+    ) -> int:
+        now = utc_now()
+        with self.engine.begin() as conn:
+            result = conn.execute(
+                insert(searches_table).values(
+                    user_id=user_id,
+                    title=title,
+                    city=city,
+                    region_id=region_id,
+                    rooms=",".join(rooms),
+                    min_price=min_price,
+                    max_price=max_price,
+                    rent_type=rent_type,
+                    sort_by=sort_by,
+                    polygon=polygon,
+                    area_label=area_label,
+                    manual_url=manual_url,
+                    use_generated_url=use_generated_url,
+                    is_active=is_active,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            return int(result.inserted_primary_key[0])
+
+    def update_search(self, search_id: int, **values: object) -> None:
+        allowed_keys = {
+            "title",
+            "city",
+            "region_id",
+            "rooms",
+            "min_price",
+            "max_price",
+            "rent_type",
+            "sort_by",
+            "polygon",
+            "area_label",
+            "manual_url",
+            "use_generated_url",
+            "is_active",
+            "last_error_type",
+            "last_error_at",
+            "cooldown_until",
+        }
+        unknown_keys = set(values) - allowed_keys
+        if unknown_keys:
+            unknown = ", ".join(sorted(unknown_keys))
+            raise ValueError(f"Unknown search fields: {unknown}")
+
+        payload = dict(values)
+        if isinstance(payload.get("rooms"), tuple):
+            payload["rooms"] = ",".join(str(room) for room in payload["rooms"])
+        payload["updated_at"] = utc_now()
+
+        with self.engine.begin() as conn:
+            conn.execute(
+                update(searches_table).where(searches_table.c.id == search_id).values(**payload)
+            )
+
+    def record_search_success(self, search_id: int) -> None:
+        self.update_search(
+            search_id,
+            last_error_type=None,
+            last_error_at=None,
+            cooldown_until=None,
+        )
+
+    def record_search_error(
+        self,
+        search_id: int,
+        *,
+        error_type: str,
+        cooldown_until: str | None,
+    ) -> None:
+        self.update_search(
+            search_id,
+            last_error_type=error_type,
+            last_error_at=utc_now(),
+            cooldown_until=cooldown_until,
+        )
+
+    def active_searches_for_user(self, user_id: int) -> list[dict[str, object]]:
+        with self.engine.begin() as conn:
+            rows = conn.execute(
+                select(searches_table)
+                .where(searches_table.c.user_id == user_id)
+                .where(searches_table.c.is_active.is_(True))
+                .order_by(searches_table.c.created_at.asc())
+            ).fetchall()
+        return [dict(row._mapping) for row in rows]
+
+    def searches_for_user(self, user_id: int) -> list[dict[str, object]]:
+        with self.engine.begin() as conn:
+            rows = conn.execute(
+                select(searches_table)
+                .where(searches_table.c.user_id == user_id)
+                .order_by(searches_table.c.created_at.asc())
+            ).fetchall()
+        return [dict(row._mapping) for row in rows]
+
+    def first_search_for_user(self, user_id: int) -> dict[str, object] | None:
+        searches = self.searches_for_user(user_id)
+        return searches[0] if searches else None
+
+    def first_active_search_for_user(self, user_id: int) -> dict[str, object] | None:
+        searches = self.active_searches_for_user(user_id)
+        return searches[0] if searches else None
+
+    def searches_count(self) -> int:
+        return self.searches_count_by_status()
+
+    def searches_count_by_status(self, *, active: bool | None = None) -> int:
+        query = select(func.count()).select_from(searches_table)
+        if active is not None:
+            query = query.where(searches_table.c.is_active.is_(active))
+        with self.engine.begin() as conn:
+            return int(conn.execute(query).scalar_one())
+
+    def recent_searches(self, limit: int = 10) -> list[dict[str, object]]:
+        with self.engine.begin() as conn:
+            rows = conn.execute(
+                select(
+                    searches_table.c.id.label("id"),
+                    searches_table.c.city.label("city"),
+                    searches_table.c.rooms.label("rooms"),
+                    searches_table.c.min_price.label("min_price"),
+                    searches_table.c.max_price.label("max_price"),
+                    searches_table.c.rent_type.label("rent_type"),
+                    searches_table.c.is_active.label("is_active"),
+                    searches_table.c.last_error_type.label("last_error_type"),
+                    searches_table.c.last_error_at.label("last_error_at"),
+                    searches_table.c.cooldown_until.label("cooldown_until"),
+                    searches_table.c.updated_at.label("updated_at"),
+                    users_table.c.telegram_chat_id.label("telegram_chat_id"),
+                    users_table.c.username.label("username"),
+                )
+                .select_from(searches_table.join(users_table))
+                .order_by(searches_table.c.updated_at.desc())
+                .limit(limit)
+            ).fetchall()
+        return [dict(row._mapping) for row in rows]
+
+    def active_searches(self) -> list[dict[str, object]]:
+        with self.engine.begin() as conn:
+            rows = conn.execute(
+                select(
+                    searches_table.c.id.label("id"),
+                    searches_table.c.user_id.label("user_id"),
+                    searches_table.c.title.label("title"),
+                    searches_table.c.city.label("city"),
+                    searches_table.c.region_id.label("region_id"),
+                    searches_table.c.rooms.label("rooms"),
+                    searches_table.c.min_price.label("min_price"),
+                    searches_table.c.max_price.label("max_price"),
+                    searches_table.c.rent_type.label("rent_type"),
+                    searches_table.c.sort_by.label("sort_by"),
+                    searches_table.c.polygon.label("polygon"),
+                    searches_table.c.area_label.label("area_label"),
+                    searches_table.c.manual_url.label("manual_url"),
+                    searches_table.c.use_generated_url.label("use_generated_url"),
+                    searches_table.c.is_active.label("is_active"),
+                    searches_table.c.last_error_type.label("last_error_type"),
+                    searches_table.c.last_error_at.label("last_error_at"),
+                    searches_table.c.cooldown_until.label("cooldown_until"),
+                    users_table.c.telegram_chat_id.label("telegram_chat_id"),
+                )
+                .select_from(searches_table.join(users_table))
+                .where(searches_table.c.is_active.is_(True))
+                .where(users_table.c.is_active.is_(True))
+                .where(
+                    (searches_table.c.cooldown_until.is_(None))
+                    | (searches_table.c.cooldown_until <= utc_now())
+                )
+                .order_by(searches_table.c.id.asc())
+            ).fetchall()
+        return [dict(row._mapping) for row in rows]
+
+    def cooldown_searches_count(self) -> int:
+        now = utc_now()
+        with self.engine.begin() as conn:
+            return int(
+                conn.execute(
+                    select(func.count())
+                    .select_from(searches_table)
+                    .where(searches_table.c.is_active.is_(True))
+                    .where(searches_table.c.cooldown_until.is_not(None))
+                    .where(searches_table.c.cooldown_until > now)
+                ).scalar_one()
+            )
+
+    def search_seen_count(self, search_id: int) -> int:
+        with self.engine.begin() as conn:
+            rows = conn.execute(
+                select(search_seen_listings_table.c.cian_id).where(
+                    search_seen_listings_table.c.search_id == search_id
+                )
+            ).fetchall()
+        return len(rows)
+
+    def unseen_listings_for_search(
+        self, search_id: int, listings: Iterable[Listing]
+    ) -> list[Listing]:
+        rows = list(listings)
+        if not rows:
+            return []
+
+        listing_ids = [listing.cian_id for listing in rows]
+        with self.engine.begin() as conn:
+            seen_rows = conn.execute(
+                select(search_seen_listings_table.c.cian_id)
+                .where(search_seen_listings_table.c.search_id == search_id)
+                .where(search_seen_listings_table.c.cian_id.in_(listing_ids))
+            ).fetchall()
+
+        seen_ids = {str(row._mapping["cian_id"]) for row in seen_rows}
+        return [listing for listing in rows if listing.cian_id not in seen_ids]
+
+    def listings_seen_for_search(self, search_id: int, limit: int) -> list[Listing]:
+        with self.engine.begin() as conn:
+            rows = conn.execute(
+                select(
+                    listings_table.c.cian_id,
+                    listings_table.c.url,
+                    listings_table.c.title,
+                    listings_table.c.price,
+                    listings_table.c.address,
+                    listings_table.c.rooms,
+                    listings_table.c.raw_json,
+                )
+                .select_from(
+                    search_seen_listings_table.join(
+                        listings_table,
+                        search_seen_listings_table.c.cian_id == listings_table.c.cian_id,
+                    )
+                )
+                .where(search_seen_listings_table.c.search_id == search_id)
+                .order_by(search_seen_listings_table.c.first_seen_at.desc())
+                .limit(limit)
+            ).fetchall()
+
+        return [self._row_to_listing(dict(row._mapping)) for row in rows]
+
+    def mark_many_search_listings_seen(
+        self,
+        *,
+        search_id: int,
+        cian_ids: Iterable[str],
+        sent: bool = False,
+    ) -> int:
+        count = 0
+        for cian_id in cian_ids:
+            self.mark_search_listing_seen(search_id=search_id, cian_id=cian_id, sent=sent)
+            count += 1
+        return count
+
+    def mark_all_listings_seen_for_search(self, search_id: int, *, sent: bool = False) -> int:
+        with self.engine.begin() as conn:
+            rows = conn.execute(select(listings_table.c.cian_id)).fetchall()
+        return self.mark_many_search_listings_seen(
+            search_id=search_id,
+            cian_ids=[str(row._mapping["cian_id"]) for row in rows],
+            sent=sent,
+        )
+
+    def clear_seen_for_search(self, search_id: int) -> None:
+        with self.engine.begin() as conn:
+            conn.execute(
+                delete(search_seen_listings_table).where(
+                    search_seen_listings_table.c.search_id == search_id
+                )
+            )
+
+    def mark_search_listing_seen(
+        self,
+        *,
+        search_id: int,
+        cian_id: str,
+        sent: bool = False,
+    ) -> None:
+        now = utc_now()
+        with self.engine.begin() as conn:
+            row = conn.execute(
+                select(search_seen_listings_table.c.search_id)
+                .where(search_seen_listings_table.c.search_id == search_id)
+                .where(search_seen_listings_table.c.cian_id == cian_id)
+            ).first()
+            if row is not None:
+                if sent:
+                    conn.execute(
+                        update(search_seen_listings_table)
+                        .where(search_seen_listings_table.c.search_id == search_id)
+                        .where(search_seen_listings_table.c.cian_id == cian_id)
+                        .values(sent_at=now)
+                    )
+                return
+
+            conn.execute(
+                insert(search_seen_listings_table).values(
+                    search_id=search_id,
+                    cian_id=cian_id,
+                    first_seen_at=now,
+                    sent_at=now if sent else None,
+                )
+            )
 
     @staticmethod
-    def _row_to_listing(row: sqlite3.Row) -> Listing:
+    def _row_to_listing(row: dict[str, object]) -> Listing:
         try:
-            raw = json.loads(row["raw_json"])
+            raw = json.loads(str(row["raw_json"]))
         except json.JSONDecodeError:
             raw = {}
         return Listing(
-            cian_id=row["cian_id"],
-            url=row["url"],
-            title=row["title"],
-            price=row["price"],
-            address=row["address"],
-            rooms=row["rooms"],
+            cian_id=str(row["cian_id"]),
+            url=str(row["url"]),
+            title=row["title"] if isinstance(row["title"], str) else None,
+            price=row["price"] if isinstance(row["price"], int) else None,
+            address=row["address"] if isinstance(row["address"], str) else None,
+            rooms=row["rooms"] if isinstance(row["rooms"], str) else None,
             raw=raw,
         )
+
+
+def _sqlite_url(path: Path) -> str:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return f"sqlite:///{path.absolute()}"
+
+
+def build_database_url(path: Path, database_url: str | None = None) -> str:
+    if database_url:
+        return _normalize_database_url(database_url)
+    return _sqlite_url(path)
+
+
+def _normalize_database_url(database_url: str) -> str:
+    if database_url.startswith("postgres://"):
+        return database_url.replace("postgres://", "postgresql+psycopg://", 1)
+    if database_url.startswith("postgresql://"):
+        return database_url.replace("postgresql://", "postgresql+psycopg://", 1)
+    return database_url

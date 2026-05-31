@@ -58,6 +58,59 @@ def test_multi_user_check_seeds_existing_listings_before_notifications(
     assert last_run["new_listings"] == 1
 
 
+def test_empty_first_check_initializes_search_without_cooldown(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    settings = replace(
+        Settings.from_env(env_file=None),
+        database_path=tmp_path / "test.sqlite3",
+        dry_run=True,
+        listing_limit=10,
+    )
+    store = ListingStore(settings.database_path)
+    store.init()
+    user_id = store.upsert_user(telegram_chat_id="100")
+    search_id = store.create_search(
+        user_id=user_id,
+        title="Основной поиск",
+        city="Казань",
+        region_id="4777",
+        rooms=("1",),
+        min_price=None,
+        max_price=None,
+        rent_type="long",
+        sort_by="creation_date_from_newer_to_older",
+    )
+    batches = [
+        [],
+        [_listing("2")],
+    ]
+
+    monkeypatch.setattr(service, "build_scraper", lambda _settings: object())
+    monkeypatch.setattr(service, "scrape", lambda _scraper, _limit: batches.pop(0))
+
+    assert service.run_check(settings) == 0
+    initialized_search = store.first_search_for_user(user_id)
+    first_run = store.last_check_run()
+
+    assert initialized_search is not None
+    assert initialized_search["initialized_at"] is not None
+    assert initialized_search["last_error_type"] is None
+    assert initialized_search["cooldown_until"] is None
+    assert store.search_seen_count(search_id) == 0
+    assert first_run is not None
+    assert first_run["status"] == "success"
+    assert first_run["listings_found"] == 0
+
+    assert service.run_check(settings) == 0
+    second_run = store.last_check_run()
+
+    assert store.search_seen_count(search_id) == 1
+    assert second_run is not None
+    assert second_run["new_listings"] == 1
+
+
 def test_check_for_chat_without_active_search_does_not_scrape(
     tmp_path: Path,
     monkeypatch,
@@ -490,7 +543,7 @@ def test_successful_search_clears_previous_cooldown(tmp_path: Path, monkeypatch)
     assert search["cooldown_until"] is None
 
 
-def test_partial_check_notifies_admins(
+def test_partial_check_notifies_admins_for_actionable_errors(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -521,7 +574,7 @@ def test_partial_check_notifies_admins(
     monkeypatch.setattr(
         service,
         "scrape",
-        lambda _scraper, _limit: (_ for _ in ()).throw(RuntimeError("captcha")),
+        lambda _scraper, _limit: (_ for _ in ()).throw(NetworkFetchError("timeout")),
     )
     monkeypatch.setattr(
         service,
@@ -533,7 +586,52 @@ def test_partial_check_notifies_admins(
 
     assert {chat_id for chat_id, _text in sent_messages} == {"900", "901"}
     assert all("Status: partial" in text for _chat_id, text in sent_messages)
-    assert all("captcha" in text for _chat_id, text in sent_messages)
+    assert all("network" in text for _chat_id, text in sent_messages)
+
+
+def test_partial_check_does_not_push_admins_for_expected_parser_noise(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    settings = replace(
+        Settings.from_env(env_file=None),
+        database_path=tmp_path / "test.sqlite3",
+        dry_run=False,
+        telegram_bot_token="token",
+        admin_telegram_ids=frozenset({"900"}),
+    )
+    store = ListingStore(settings.database_path)
+    store.init()
+    user_id = store.upsert_user(telegram_chat_id="100")
+    store.create_search(
+        user_id=user_id,
+        title="Падающий поиск",
+        city="Москва",
+        region_id="1",
+        rooms=("all",),
+        min_price=None,
+        max_price=None,
+        rent_type="all",
+        sort_by="creation_date_from_newer_to_older",
+    )
+    sent_messages: list[str] = []
+
+    monkeypatch.setattr(service, "build_scraper", lambda _settings: object())
+    monkeypatch.setattr(
+        service,
+        "scrape",
+        lambda _scraper, _limit: (_ for _ in ()).throw(EmptyParseError("empty")),
+    )
+    monkeypatch.setattr(
+        service,
+        "send_message_sync",
+        lambda _notifier, text: sent_messages.append(text),
+    )
+
+    assert service.run_check(settings) == 0
+
+    assert sent_messages == []
+    assert store.recent_check_runs(limit=1)[0]["status"] == "partial"
 
 
 def test_partial_check_does_not_notify_admins_in_dry_run(

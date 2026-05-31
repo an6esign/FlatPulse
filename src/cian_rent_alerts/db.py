@@ -116,6 +116,7 @@ searches_table = Table(
     Column("manual_url", Text),
     Column("use_generated_url", Boolean, nullable=False, default=True),
     Column("is_active", Boolean, nullable=False, default=True),
+    Column("initialized_at", String(40)),
     Column("last_error_type", Text),
     Column("last_error_at", String(40)),
     Column("cooldown_until", String(40)),
@@ -524,6 +525,7 @@ class ListingStore:
             "manual_url",
             "use_generated_url",
             "is_active",
+            "initialized_at",
             "last_error_type",
             "last_error_at",
             "cooldown_until",
@@ -543,13 +545,15 @@ class ListingStore:
                 update(searches_table).where(searches_table.c.id == search_id).values(**payload)
             )
 
-    def record_search_success(self, search_id: int) -> None:
-        self.update_search(
-            search_id,
-            last_error_type=None,
-            last_error_at=None,
-            cooldown_until=None,
-        )
+    def record_search_success(self, search_id: int, *, initialize: bool = False) -> None:
+        values: dict[str, object] = {
+            "last_error_type": None,
+            "last_error_at": None,
+            "cooldown_until": None,
+        }
+        if initialize:
+            values["initialized_at"] = utc_now()
+        self.update_search(search_id, **values)
 
     def record_search_error(
         self,
@@ -645,6 +649,7 @@ class ListingStore:
                     searches_table.c.manual_url.label("manual_url"),
                     searches_table.c.use_generated_url.label("use_generated_url"),
                     searches_table.c.is_active.label("is_active"),
+                    searches_table.c.initialized_at.label("initialized_at"),
                     searches_table.c.last_error_type.label("last_error_type"),
                     searches_table.c.last_error_at.label("last_error_at"),
                     searches_table.c.cooldown_until.label("cooldown_until"),

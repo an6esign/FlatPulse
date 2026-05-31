@@ -309,6 +309,93 @@ PostgreSQL-данные хранятся в Docker volume `postgres_data`. В Do
 docker compose logs -f migrate bot worker
 ```
 
+## Production Operations
+
+Базовый запуск после настройки `.env`:
+
+```bash
+docker compose up -d postgres
+docker compose run --rm migrate
+docker compose up -d bot worker
+```
+
+Остановить пользовательские процессы, не выключая PostgreSQL:
+
+```bash
+docker compose stop bot worker
+```
+
+Полностью остановить compose-проект:
+
+```bash
+docker compose down
+```
+
+Перезапустить bot и worker после изменения `.env`:
+
+```bash
+docker compose up -d bot worker
+```
+
+Проверить статус контейнеров:
+
+```bash
+docker compose ps
+```
+
+Смотреть логи в реальном времени:
+
+```bash
+docker compose logs -f --tail=100 bot worker
+```
+
+Проверить БД и примененную миграцию из контейнера:
+
+```bash
+docker compose run --rm bot cian-rent-alerts --healthcheck
+```
+
+Проверить парсер без Telegram-рассылки:
+
+```bash
+docker compose run --rm worker cian-rent-alerts --parser-smoke
+```
+
+Обновить сервер с GitHub:
+
+```bash
+git pull
+docker compose build bot worker migrate
+docker compose run --rm migrate
+docker compose up -d bot worker
+docker compose ps
+```
+
+Если `bot` пишет `telegram.error.Conflict`, значит где-то запущен второй экземпляр
+Telegram polling с тем же токеном. Остановите лишний процесс или контейнер, затем
+перезапустите только один `bot`.
+
+Если `worker` внезапно рассылает объявления из старого одиночного поиска, проверьте
+локальный `.env`: для мультипользовательского режима не должны быть активны
+`CIAN_SEARCH_URL` и `TELEGRAM_CHAT_ID`.
+
+Если в логах часто появляются `captcha` или `empty_parse`, проверьте:
+
+```bash
+docker compose logs --tail=200 worker
+docker compose run --rm worker cian-rent-alerts --parser-smoke
+```
+
+HTML для диагностики сохраняется в volume `debug_pages`. Эти файлы могут содержать
+страницы выдачи и не должны попадать в git.
+
+Нельзя коммитить или отправлять в публичные каналы:
+
+- `.env`;
+- backup dump-файлы;
+- HTML из `debug_pages`;
+- Telegram token, Postgres password и chat id пользователей.
+
 ## Production Smoke Checklist
 
 Перед деплоем или после обновления на сервере:

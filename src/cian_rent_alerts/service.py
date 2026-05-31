@@ -242,11 +242,12 @@ def _run_check(settings: Settings, *, only_chat_id: str | None = None) -> int:
             chat_id = str(search["telegram_chat_id"])
             try:
                 search_settings = settings_with_search(settings, search)
+                was_initialized = bool(search.get("initialized_at"))
 
                 listings = fetch_listings(search_settings)
                 listings_found += len(listings)
                 listings_saved += store.upsert_many(listings)
-                store.record_search_success(search_id)
+                store.record_search_success(search_id, initialize=not was_initialized)
                 logger.info(
                     "Fetched %s listings for search_id=%s chat_id=%s",
                     len(listings),
@@ -254,7 +255,7 @@ def _run_check(settings: Settings, *, only_chat_id: str | None = None) -> int:
                     chat_id,
                 )
 
-                if store.search_seen_count(search_id) == 0:
+                if not was_initialized:
                     store.mark_many_search_listings_seen(
                         search_id=search_id,
                         cian_ids=[listing.cian_id for listing in listings],
@@ -324,7 +325,10 @@ def _run_check(settings: Settings, *, only_chat_id: str | None = None) -> int:
             notifications_sent=notifications_sent,
             error=error_text,
         )
-        if error_text is not None:
+        if error_text is not None and _should_notify_admins_about_check_problem(
+            status=status,
+            error=error_text,
+        ):
             _notify_admins_about_check_problem(
                 settings,
                 status=status,
@@ -505,6 +509,18 @@ def _notify_admins_about_check_problem(
             send_message_sync(notifier, text)
         except Exception:
             logger.exception("Failed to send admin problem notification to chat_id=%s", chat_id)
+
+
+def _should_notify_admins_about_check_problem(*, status: str, error: str) -> bool:
+    if status == "failed":
+        return True
+    if status != "partial":
+        return False
+    return not all(
+        error_line.startswith(("empty_parse:", "captcha:"))
+        for error_line in error.splitlines()
+        if error_line
+    )
 
 
 def _format_admin_problem_message(*, status: str, run_id: int, error: str) -> str:

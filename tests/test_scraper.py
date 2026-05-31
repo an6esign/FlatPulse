@@ -28,6 +28,7 @@ def test_build_cian_search_url() -> None:
         polygon="49.1_55.7,49.2_55.7,49.2_55.8",
     )
 
+    assert url.startswith("https://kazan.cian.ru/cat.php?")
     assert "cat.php" in url
     assert "region=4777" in url
     assert "deal_type=rent" in url
@@ -53,6 +54,20 @@ def test_build_cian_search_url_with_any_rent_type() -> None:
     assert "type=4" not in url
     assert "type=2" not in url
     assert "room1=1" not in url
+
+
+def test_build_cian_search_url_uses_moscow_host() -> None:
+    url = build_cian_search_url(
+        city="Москва",
+        region_id=None,
+        rooms=("all",),
+        min_price=None,
+        max_price=None,
+        rent_type="all",
+        sort_by="default",
+    )
+
+    assert url.startswith("https://www.cian.ru/cat.php?")
 
 
 def test_extract_polygon_from_cian_url() -> None:
@@ -133,6 +148,39 @@ def test_scrape_raises_empty_parse_and_saves_debug_html(tmp_path) -> None:
     debug_files = list(tmp_path.glob("*_empty_parse.html"))
     assert len(debug_files) == 1
     assert "normal page" in debug_files[0].read_text(encoding="utf-8")
+
+
+def test_scrape_returns_empty_list_for_valid_empty_results_page(tmp_path) -> None:
+    class EmptyResultsScraper:
+        config = ScraperConfig(
+            search_url="https://www.cian.ru/cat.php",
+            user_agent="test",
+            timeout_seconds=1,
+            limit=10,
+            debug_dir=tmp_path,
+        )
+
+        def fetch(self) -> str:
+            return """
+            <html>
+              <body>
+                <script>
+                  window.__state = {
+                    "application": "frontend-serp",
+                    "pageType": "Listing",
+                    "offersQty": 0,
+                    "products": []
+                  };
+                </script>
+              </body>
+            </html>
+            """
+
+        def parse(self, _html: str):
+            return []
+
+    assert scrape(EmptyResultsScraper(), limit=10) == []
+    assert list(tmp_path.glob("*.html")) == []
 
 
 def test_access_check_raises_captcha_and_saves_debug_html(tmp_path) -> None:

@@ -17,6 +17,16 @@ CITY_REGION_IDS = {
     "Самара": "4966",
 }
 
+CITY_HOSTS = {
+    "Москва": "www.cian.ru",
+    "Санкт-Петербург": "spb.cian.ru",
+    "Казань": "kazan.cian.ru",
+    "Екатеринбург": "ekb.cian.ru",
+    "Нижний Новгород": "nn.cian.ru",
+    "Новосибирск": "novosibirsk.cian.ru",
+    "Самара": "samara.cian.ru",
+}
+
 SORT_VALUES = {
     "default": None,
     "price_from_min_to_max": "price_object_order",
@@ -88,7 +98,8 @@ def build_cian_search_url(
     if sort_value is not None:
         query.append(("sort", sort_value))
 
-    return f"https://cian.ru/cat.php?{urlencode(query)}"
+    host = CITY_HOSTS.get(city, "www.cian.ru")
+    return f"https://{host}/cat.php?{urlencode(query)}"
 
 
 def extract_polygon(value: str) -> str:

@@ -382,7 +382,7 @@ class SettingsBot:
         if search is None:
             raise ConfigError("Не удалось найти поиск пользователя")
         search_id = int(search["id"])
-        self.store.update_search(search_id, **values, is_active=True)
+        self.store.update_search(search_id, **values, is_active=True, initialized_at=None)
         self.store.clear_seen_for_search(search_id)
 
     def _get_awaiting(self, update: Update) -> str | None:
@@ -612,7 +612,7 @@ class SettingsBot:
             )
             return
 
-        was_unseeded = self.store.search_seen_count(int(search["id"])) == 0
+        was_unseeded = not search.get("initialized_at")
         self.store.set_user_state(
             user_id,
             "last_manual_check_at",
@@ -1029,7 +1029,7 @@ class SettingsBot:
             limit=SHOW_FOUND_LIMIT,
         )
         if not listings:
-            await _reply(update, "Пока нечего показать. Сначала запустите проверку.")
+            await _reply(update, "По текущим фильтрам пока ничего не найдено.")
             return
 
         if not self.settings.telegram_bot_token:
@@ -1071,7 +1071,7 @@ class SettingsBot:
             await _reply(update, "Не удалось найти поиск.")
             return
         search_id = int(search["id"])
-        self.store.update_search(search_id, is_active=True)
+        self.store.update_search(search_id, is_active=True, initialized_at=None)
         self.store.clear_seen_for_search(search_id)
         await _respond(
             update,

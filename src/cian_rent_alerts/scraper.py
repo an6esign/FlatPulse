@@ -217,6 +217,9 @@ def scrape(scraper: CianScraper, limit: int) -> list[Listing]:
     html = scraper.fetch()
     listings = scraper.parse(html)
     if not listings:
+        if _looks_like_empty_results_page(html):
+            logger.info("CIAN returned a valid empty listings page")
+            return []
         config = getattr(scraper, "config", None)
         debug_dir = getattr(config, "debug_dir", None)
         search_url = getattr(config, "search_url", "unknown")
@@ -224,6 +227,14 @@ def scrape(scraper: CianScraper, limit: int) -> list[Listing]:
         logger.warning("No listings found on the page")
         raise EmptyParseError("No listings found on the page")
     return listings[:limit]
+
+
+def _looks_like_empty_results_page(html: str) -> bool:
+    normalized = html.replace(r"\"", '"')
+    has_serp_state = "frontend-serp" in normalized or '"pageType":"Listing"' in normalized
+    has_empty_count = re.search(r'"offersQty"\s*:\s*0', normalized) is not None
+    has_empty_products = re.search(r'"products"\s*:\s*\[\]', normalized) is not None
+    return has_serp_state and (has_empty_count or has_empty_products)
 
 
 def _walk_json_for_listings(payload: Any) -> Iterable[Listing]:

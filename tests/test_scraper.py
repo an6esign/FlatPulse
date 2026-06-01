@@ -70,6 +70,21 @@ def test_build_cian_search_url_uses_moscow_host() -> None:
     assert url.startswith("https://www.cian.ru/cat.php?")
 
 
+def test_build_cian_search_url_resolves_manual_city_region() -> None:
+    url = build_cian_search_url(
+        city="Сочи",
+        region_id=None,
+        rooms=("all",),
+        min_price=None,
+        max_price=None,
+        rent_type="all",
+        sort_by="default",
+    )
+
+    assert url.startswith("https://www.cian.ru/cat.php?")
+    assert "region=4998" in url
+
+
 def test_extract_polygon_from_cian_url() -> None:
     polygon = extract_polygon(
         "https://kazan.cian.ru/map/?in_polygon[0]=49.1_55.7%2C49.2_55.7%2C49.2_55.8"

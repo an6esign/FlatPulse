@@ -19,7 +19,7 @@ from cian_rent_alerts.bot import (
     _stopped_search_keyboard,
     _welcome_text,
 )
-from cian_rent_alerts.config import Settings
+from cian_rent_alerts.config import ConfigError, Settings
 
 
 def test_format_radius_label_is_stable_for_settings_display() -> None:
@@ -116,12 +116,28 @@ def test_configure_search_reply_button_is_persistent() -> None:
 
 def test_manual_onboarding_parsers_accept_plain_text() -> None:
     assert _parse_manual_city("Москва") == ("Москва", "1")
+    assert _parse_manual_city("Сочи") == ("Сочи", "4998")
+    assert _parse_manual_city(" уфа ") == ("Уфа", "176245")
+    assert _parse_manual_city("королев") == ("Королёв", "4813")
+    assert _parse_manual_city("ростов на дону") == ("Ростов-на-Дону", "4959")
     assert _parse_manual_rooms("студия") == ("studio",)
     assert _parse_manual_rooms("1,2") == ("1", "2")
     assert _parse_manual_price("Любая") == (None, None)
     assert _parse_manual_price("до 60000") == (None, 60000)
     assert _parse_manual_price("60000-90000") == (60000, 90000)
     assert _parse_manual_rent("посуточная") == "short"
+
+
+def test_manual_city_rejects_unknown_city_without_region_id_hint() -> None:
+    try:
+        _parse_manual_city("Город которого нет")
+    except ConfigError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("Expected ConfigError")
+
+    assert "Не нашел такой город в ЦИАН" in message
+    assert "region" not in message.lower()
 
 
 def test_manual_check_cooldown_blocks_repeated_checks() -> None:

@@ -25,6 +25,7 @@ from telegram.ext import (
     filters,
 )
 
+from .cian_locations import find_cian_location
 from .cian_url import extract_polygon
 from .config import ConfigError, Settings
 from .db import ListingStore
@@ -436,19 +437,20 @@ class SettingsBot:
     async def set_city(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         args = context.args
         if not args:
-            await _reply(update, "Использование: /set_city Казань 4777")
+            await _reply(update, "Использование: /set_city Сочи")
             return
-        region_id = args[-1] if args[-1].isdigit() else None
-        city_parts = args[:-1] if region_id else args
-        city = " ".join(city_parts).strip()
-        if not city:
-            await _reply(update, "Укажите город: /set_city Казань 4777")
+        try:
+            city, region_id = _parse_manual_city(" ".join(args))
+        except ConfigError as exc:
+            await _reply(update, str(exc))
             return
 
-        updates: dict[str, object] = {"city": city, "use_generated_url": True}
-        if region_id:
-            updates["region_id"] = region_id
-        self._update_current_search(update, **updates)
+        self._update_current_search(
+            update,
+            city=city,
+            region_id=region_id,
+            use_generated_url=True,
+        )
         await self._confirm_settings(update, "Город обновлен.")
 
     async def set_region(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -730,7 +732,7 @@ class SettingsBot:
             self._set_awaiting(update, "city")
             await _respond(
                 update,
-                "Введите город сообщением.\n\nМожно: Москва, Казань, Санкт-Петербург.",
+                "Введите город сообщением.\n\nНапример: Сочи, Уфа, Краснодар.",
                 _city_keyboard(),
             )
             return
@@ -851,7 +853,7 @@ class SettingsBot:
             self._set_awaiting(update, "city")
             await _respond(
                 update,
-                "Введите город сообщением.\n\nМожно: Москва, Казань, Санкт-Петербург.",
+                "Введите город сообщением.\n\nНапример: Сочи, Уфа, Краснодар.",
                 _onboarding_city_keyboard(),
             )
             return
@@ -1805,17 +1807,12 @@ def _rooms_from_command(value: str) -> tuple[str, ...]:
 
 
 def _parse_manual_city(value: str) -> tuple[str, str]:
-    normalized = value.strip()
-    lowered = normalized.lower()
-    for city, region_id in CITY_OPTIONS.values():
-        if lowered == city.lower():
-            return city, region_id
-
-    parts = normalized.rsplit(maxsplit=1)
-    if len(parts) == 2 and parts[1].isdigit():
-        return parts[0].strip(), parts[1]
-
-    raise ConfigError("Пока можно ввести: Москва, Казань, Санкт-Петербург. Или город и region id.")
+    location = find_cian_location(value)
+    if location is None:
+        raise ConfigError(
+            "Не нашел такой город в ЦИАН. Проверьте написание или попробуйте другой город."
+        )
+    return location
 
 
 def _parse_manual_rooms(value: str) -> tuple[str, ...]:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import hashlib
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -109,6 +110,8 @@ class Settings:
     use_playwright: bool
     playwright_fallback: bool
     playwright_headless: bool
+    environment: str
+    prod_telegram_bot_token_hash: str | None
 
     @classmethod
     def from_env(cls, env_file: Path | None = Path(".env")) -> "Settings":
@@ -155,7 +158,22 @@ class Settings:
             use_playwright=_as_bool(os.getenv("USE_PLAYWRIGHT"), False),
             playwright_fallback=_as_bool(os.getenv("PLAYWRIGHT_FALLBACK"), False),
             playwright_headless=_as_bool(os.getenv("PLAYWRIGHT_HEADLESS"), True),
+            environment=os.getenv("ENVIRONMENT", "prod").strip().lower(),
+            prod_telegram_bot_token_hash=os.getenv("PROD_TELEGRAM_BOT_TOKEN_HASH") or None,
         )
+
+    def validate_environment(self) -> None:
+        if self.environment not in {"dev", "prod"}:
+            raise ConfigError("ENVIRONMENT must be 'dev' or 'prod'")
+        if self.environment != "dev":
+            return
+        if not self.telegram_bot_token or not self.prod_telegram_bot_token_hash:
+            return
+        token_hash = hashlib.sha256(self.telegram_bot_token.encode()).hexdigest()
+        if token_hash == self.prod_telegram_bot_token_hash.strip().lower():
+            raise ConfigError(
+                "Dev environment is configured with the production Telegram bot token"
+            )
 
     def require_telegram(self) -> None:
         if self.dry_run:

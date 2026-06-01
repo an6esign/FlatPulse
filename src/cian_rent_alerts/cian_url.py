@@ -4,18 +4,9 @@ import re
 from urllib.parse import urlencode
 from urllib.parse import parse_qs, unquote, urlsplit
 
+from .cian_locations import CIAN_LOCATION_REGION_IDS
 from .config import ConfigError
 
-
-CITY_REGION_IDS = {
-    "Москва": "1",
-    "Санкт-Петербург": "2",
-    "Казань": "4777",
-    "Екатеринбург": "4743",
-    "Нижний Новгород": "4885",
-    "Новосибирск": "4897",
-    "Самара": "4966",
-}
 
 CITY_HOSTS = {
     "Москва": "www.cian.ru",
@@ -47,7 +38,7 @@ def build_cian_search_url(
     sort_by: str,
     polygon: str | None = None,
 ) -> str:
-    resolved_region_id = region_id or CITY_REGION_IDS.get(city)
+    resolved_region_id = region_id or CIAN_LOCATION_REGION_IDS.get(city)
     if not resolved_region_id:
         raise ConfigError(
             f"Unknown CIAN city {city!r}. Set CIAN_REGION_ID explicitly or add the city mapping."

@@ -114,8 +114,7 @@ cian-rent-alerts
 Показать фактическую ссылку поиска.
 
 ```text
-/set_city Казань 4777
-/set_region 4777
+/set_city Сочи
 /set_price 35000 45000
 /set_rooms 1,2
 /set_rent long
@@ -308,6 +307,55 @@ PostgreSQL-данные хранятся в Docker volume `postgres_data`. В Do
 ```bash
 docker compose logs -f migrate bot worker
 ```
+
+## Local Dev Bot
+
+Для локальной проверки изменений используйте отдельного Telegram-бота и отдельную
+локальную БД. Не запускайте dev-окружение с production token: Telegram polling
+должен быть один на один bot token.
+
+Подготовка:
+
+```bash
+cp .env.dev.example .env.dev
+```
+
+Заполните в `.env.dev`:
+
+```env
+TELEGRAM_BOT_TOKEN=dev_bot_token_from_botfather
+ADMIN_TELEGRAM_IDS=your_admin_chat_id
+POSTGRES_PASSWORD=dev_only_password
+```
+
+Запуск локального dev-бота:
+
+```bash
+docker compose --env-file .env.dev -f docker-compose.dev.yml up --build -d postgres bot worker
+```
+
+Проверить состояние:
+
+```bash
+docker compose --env-file .env.dev -f docker-compose.dev.yml ps
+docker compose --env-file .env.dev -f docker-compose.dev.yml logs -f --tail=100 bot worker
+docker compose --env-file .env.dev -f docker-compose.dev.yml exec -T worker cian-rent-alerts --healthcheck
+```
+
+Остановить dev-бота, сохранив локальную dev-БД:
+
+```bash
+docker compose --env-file .env.dev -f docker-compose.dev.yml stop bot worker
+```
+
+Полностью удалить локальную dev-БД и debug pages:
+
+```bash
+docker compose --env-file .env.dev -f docker-compose.dev.yml down -v
+```
+
+Dev compose использует project name `flatpulse-dev`, поэтому контейнеры и volumes
+не пересекаются с production VPS и обычным локальным `docker-compose.yml`.
 
 ## Production Operations
 

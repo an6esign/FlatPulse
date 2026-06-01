@@ -1,5 +1,7 @@
 import pytest
 import logging
+import hashlib
+from dataclasses import replace
 
 from cian_rent_alerts.config import ConfigError, Settings
 from cian_rent_alerts.main import (
@@ -58,6 +60,30 @@ def test_configure_logging_verbose_overrides_log_level() -> None:
 
     assert logging.getLogger().level == logging.DEBUG
     assert logging.getLogger("httpx").level == logging.WARNING
+
+
+def test_dev_environment_rejects_production_telegram_token() -> None:
+    token = "1234567890:devShouldNotUseProdTokenHash"
+    settings = replace(
+        Settings.from_env(env_file=None),
+        environment="dev",
+        telegram_bot_token=token,
+        prod_telegram_bot_token_hash=hashlib.sha256(token.encode()).hexdigest(),
+    )
+
+    with pytest.raises(ConfigError, match="production Telegram bot token"):
+        settings.validate_environment()
+
+
+def test_dev_environment_allows_different_telegram_token() -> None:
+    settings = replace(
+        Settings.from_env(env_file=None),
+        environment="dev",
+        telegram_bot_token="1234567890:devToken",
+        prod_telegram_bot_token_hash=hashlib.sha256(b"prodToken").hexdigest(),
+    )
+
+    settings.validate_environment()
 
 
 def test_run_parser_smoke_returns_success(monkeypatch) -> None:

@@ -71,6 +71,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         settings = Settings.from_env()
+        settings.validate_environment()
         if args.init_db:
             ListingStore(settings.database_path, settings.database_url).init()
             logging.info("Database initialized")

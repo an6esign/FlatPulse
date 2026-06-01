@@ -98,3 +98,45 @@ def test_user_state_flow(tmp_path: Path) -> None:
 
     store.delete_user_state(user_id, "awaiting")
     assert store.get_user_state(user_id, "awaiting") is None
+
+
+def test_current_search_for_user_uses_latest_and_can_deactivate_older(
+    tmp_path: Path,
+) -> None:
+    store = ListingStore(tmp_path / "test.sqlite3")
+    store.init()
+    user_id = store.upsert_user(telegram_chat_id="100")
+    old_search_id = store.create_search(
+        user_id=user_id,
+        title="Старый поиск",
+        city="Казань",
+        region_id="4777",
+        rooms=("1",),
+        min_price=None,
+        max_price=None,
+        rent_type="long",
+        sort_by="creation_date_from_newer_to_older",
+    )
+    new_search_id = store.create_search(
+        user_id=user_id,
+        title="Новый поиск",
+        city="Москва",
+        region_id="1",
+        rooms=("all",),
+        min_price=None,
+        max_price=None,
+        rent_type="all",
+        sort_by="creation_date_from_newer_to_older",
+    )
+
+    current = store.current_search_for_user(user_id)
+
+    assert current is not None
+    assert current["id"] == new_search_id
+    assert [search["id"] for search in store.active_searches()] == [new_search_id]
+
+    store.deactivate_other_searches_for_user(user_id, new_search_id)
+    searches = store.searches_for_user(user_id)
+
+    assert {search["id"] for search in searches if search["is_active"]} == {new_search_id}
+    assert {search["id"] for search in searches if not search["is_active"]} == {old_search_id}

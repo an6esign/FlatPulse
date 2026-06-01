@@ -8,6 +8,7 @@ from cian_rent_alerts.bot import (
     _format_area,
     _format_radius_label,
     _format_settings,
+    _initial_seed_text,
     _main_keyboard,
     _manual_check_cooldown_remaining,
     _parse_manual_city,
@@ -59,11 +60,12 @@ def test_show_found_limit_is_20() -> None:
 def test_main_keyboard_starts_with_clear_user_actions() -> None:
     keyboard = _main_keyboard().inline_keyboard
 
-    assert keyboard[0][0].text == "Настроить поиск"
+    assert keyboard[0][0].text == "🔍 Настроить поиск"
     assert keyboard[0][0].callback_data == "cfg:setup"
-    assert keyboard[1][0].text == "Проверить сейчас"
-    assert keyboard[2][0].text == "Мои настройки"
-    assert keyboard[3][0].text == "Остановить поиск"
+    assert keyboard[1][0].text == "⚡ Проверить новые квартиры"
+    assert keyboard[2][0].text == "⚙️ Настройки"
+    assert keyboard[2][1].text == "❓ Как это работает"
+    assert keyboard[3][0].text == "⏸️ Остановить уведомления"
     assert keyboard[3][0].callback_data == "cfg:stop"
 
 
@@ -85,8 +87,16 @@ def test_format_settings_can_show_search_status() -> None:
 def test_welcome_text_explains_first_action() -> None:
     text = _welcome_text()
 
-    assert "Настройка поиска" not in text
-    assert "Начните с настройки поиска" in text
+    assert "Не проверяйте ЦИАН каждые 10 минут" in text
+    assert "FlatPulse сам отслеживает новые квартиры" in text
+    assert "Настройте поиск один раз" in text
+
+
+def test_initial_seed_text_does_not_claim_total_found_count() -> None:
+    text = _initial_seed_text(28)
+
+    assert "первые объявления из текущей выдачи: 28" in text
+    assert "найдено и запомнено" not in text
 
 
 def test_first_entry_uses_start_reply_button() -> None:
@@ -101,7 +111,7 @@ def test_first_entry_uses_start_reply_button() -> None:
 def test_configure_search_reply_button_is_persistent() -> None:
     keyboard = _configure_search_reply_keyboard().keyboard
 
-    assert keyboard[0][0].text == "Настроить поиск"
+    assert keyboard[0][0].text == "Меню"
 
 
 def test_manual_onboarding_parsers_accept_plain_text() -> None:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from dataclasses import dataclass
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from typing import Mapping
@@ -31,6 +32,12 @@ _CHECK_LOCK = threading.Lock()
 
 class CheckAlreadyRunning(RuntimeError):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class CheckRunResult:
+    run_id: int | None
+    notifications_sent: int
 
 
 def build_scraper(settings: Settings) -> RequestsCianScraper | PlaywrightCianScraper:
@@ -171,20 +178,41 @@ def run_check(
     settings: Settings,
     *,
     only_chat_id: str | None = None,
+    only_search_id: int | None = None,
     fail_if_running: bool = False,
 ) -> int:
+    return run_check_result(
+        settings,
+        only_chat_id=only_chat_id,
+        only_search_id=only_search_id,
+        fail_if_running=fail_if_running,
+    ).notifications_sent
+
+
+def run_check_result(
+    settings: Settings,
+    *,
+    only_chat_id: str | None = None,
+    only_search_id: int | None = None,
+    fail_if_running: bool = False,
+) -> CheckRunResult:
     if not _CHECK_LOCK.acquire(blocking=False):
         logger.info("Check is already running, skipping new request")
         if fail_if_running:
             raise CheckAlreadyRunning("Проверка уже выполняется")
-        return 0
+        return CheckRunResult(run_id=None, notifications_sent=0)
     try:
-        return _run_check(settings, only_chat_id=only_chat_id)
+        return _run_check(settings, only_chat_id=only_chat_id, only_search_id=only_search_id)
     finally:
         _CHECK_LOCK.release()
 
 
-def _run_check(settings: Settings, *, only_chat_id: str | None = None) -> int:
+def _run_check(
+    settings: Settings,
+    *,
+    only_chat_id: str | None = None,
+    only_search_id: int | None = None,
+) -> CheckRunResult:
     store = ListingStore(settings.database_path, settings.database_url)
     store.init()
     run_id = store.start_check_run()
@@ -195,7 +223,11 @@ def _run_check(settings: Settings, *, only_chat_id: str | None = None) -> int:
     search_errors: list[str] = []
 
     try:
-        searches = _filter_searches_by_chat(store.active_searches(), only_chat_id)
+        searches = _filter_searches(
+            store.active_searches(),
+            only_chat_id=only_chat_id,
+            only_search_id=only_search_id,
+        )
         if not searches:
             if store.searches_count() > 0:
                 logger.info("No active searches to check")
@@ -207,7 +239,7 @@ def _run_check(settings: Settings, *, only_chat_id: str | None = None) -> int:
                     new_listings=0,
                     notifications_sent=0,
                 )
-                return 0
+                return CheckRunResult(run_id=run_id, notifications_sent=0)
             if only_chat_id is not None:
                 logger.info("No active search for chat_id=%s", only_chat_id)
                 store.finish_check_run(
@@ -218,7 +250,7 @@ def _run_check(settings: Settings, *, only_chat_id: str | None = None) -> int:
                     new_listings=0,
                     notifications_sent=0,
                 )
-                return 0
+                return CheckRunResult(run_id=run_id, notifications_sent=0)
             if not settings.telegram_chat_id:
                 logger.info("No active searches to check")
                 store.finish_check_run(
@@ -229,10 +261,13 @@ def _run_check(settings: Settings, *, only_chat_id: str | None = None) -> int:
                     new_listings=0,
                     notifications_sent=0,
                 )
-                return 0
+                return CheckRunResult(run_id=run_id, notifications_sent=0)
             result = _run_global_check(store, settings)
             store.finish_check_run(run_id, status="success", **result)
-            return result["notifications_sent"]
+            return CheckRunResult(
+                run_id=run_id,
+                notifications_sent=result["notifications_sent"],
+            )
 
         if not settings.dry_run and not settings.telegram_bot_token:
             raise ConfigError("TELEGRAM_BOT_TOKEN is required unless DRY_RUN=true")
@@ -335,7 +370,7 @@ def _run_check(settings: Settings, *, only_chat_id: str | None = None) -> int:
                 run_id=run_id,
                 error=error_text,
             )
-        return notifications_sent
+        return CheckRunResult(run_id=run_id, notifications_sent=notifications_sent)
     except Exception as exc:
         store.finish_check_run(
             run_id,
@@ -534,13 +569,20 @@ def _format_admin_problem_message(*, status: str, run_id: int, error: str) -> st
     )
 
 
-def _filter_searches_by_chat(
+def _filter_searches(
     searches: list[dict[str, object]],
+    *,
     only_chat_id: str | None,
+    only_search_id: int | None,
 ) -> list[dict[str, object]]:
-    if only_chat_id is None:
-        return searches
-    return [search for search in searches if str(search["telegram_chat_id"]) == str(only_chat_id)]
+    filtered = searches
+    if only_chat_id is not None:
+        filtered = [
+            search for search in filtered if str(search["telegram_chat_id"]) == str(only_chat_id)
+        ]
+    if only_search_id is not None:
+        filtered = [search for search in filtered if int(search["id"]) == only_search_id]
+    return filtered
 
 
 def _rooms_from_search(value: object) -> tuple[str, ...]:

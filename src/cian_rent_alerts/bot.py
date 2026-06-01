@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    Message,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
     Update,
@@ -29,7 +30,7 @@ from .config import ConfigError, Settings
 from .db import ListingStore
 from .geo import build_radius_polygon, geocode_address
 from .notifier import TelegramNotifier, send_listings_sync
-from .service import CheckAlreadyRunning, build_search_url, run_check, settings_with_search
+from .service import CheckAlreadyRunning, build_search_url, run_check_result, settings_with_search
 
 logger = logging.getLogger(__name__)
 
@@ -122,9 +123,7 @@ class SettingsBot:
         application.add_handler(
             MessageHandler(filters.Regex("^Найти квартиру$"), self.find_apartment)
         )
-        application.add_handler(
-            MessageHandler(filters.Regex("^Настроить поиск$"), self.setup_from_reply)
-        )
+        application.add_handler(MessageHandler(filters.Regex("^Меню$"), self.menu_from_reply))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.on_text))
         application.add_handler(CallbackQueryHandler(self._authorized(self.on_callback)))
         return application
@@ -197,10 +196,10 @@ class SettingsBot:
             )
         await _respond(update, _welcome_text(), _main_keyboard())
 
-    async def setup_from_reply(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    async def menu_from_reply(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         self._ensure_user_search(update)
         self._clear_awaiting(update)
-        await _respond(update, "Шаг 1 из 5. Выберите город:", _onboarding_city_keyboard())
+        await _respond(update, _welcome_text(), _main_keyboard())
 
     async def on_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         awaiting = self._get_awaiting(update)
@@ -355,8 +354,9 @@ class SettingsBot:
             is_admin=chat_id in self.settings.admin_telegram_ids,
         )
 
-        search = self.store.first_search_for_user(user_id)
+        search = self.store.current_search_for_user(user_id)
         if search is not None:
+            self.store.deactivate_other_searches_for_user(user_id, int(search["id"]))
             return search
 
         default_settings = self.effective_settings()
@@ -366,7 +366,10 @@ class SettingsBot:
             **_default_user_search_values(default_settings),
             is_active=False,
         )
-        return self.store.first_search_for_user(user_id)
+        search = self.store.current_search_for_user(user_id)
+        if search is not None:
+            self.store.deactivate_other_searches_for_user(user_id, int(search["id"]))
+        return search
 
     def _current_search(self, update: Update) -> dict[str, object] | None:
         chat = update.effective_chat
@@ -375,7 +378,10 @@ class SettingsBot:
         user = self.store.get_user_by_chat_id(str(chat.id))
         if user is None:
             return None
-        return self.store.first_search_for_user(int(user["id"]))
+        search = self.store.current_search_for_user(int(user["id"]))
+        if search is not None:
+            self.store.deactivate_other_searches_for_user(int(user["id"]), int(search["id"]))
+        return search
 
     def _update_current_search(self, update: Update, **values: object) -> None:
         search = self._ensure_user_search(update)
@@ -383,6 +389,7 @@ class SettingsBot:
             raise ConfigError("Не удалось найти поиск пользователя")
         search_id = int(search["id"])
         self.store.update_search(search_id, **values, is_active=True, initialized_at=None)
+        self.store.deactivate_other_searches_for_user(int(search["user_id"]), search_id)
         self.store.clear_seen_for_search(search_id)
 
     def _get_awaiting(self, update: Update) -> str | None:
@@ -618,32 +625,35 @@ class SettingsBot:
             "last_manual_check_at",
             datetime.now(UTC).isoformat(timespec="seconds"),
         )
-        await _reply(update, "Запускаю проверку...")
+        progress_message = await _reply(update, "Запускаю проверку...")
         try:
-            count = await asyncio.to_thread(
-                run_check,
+            result = await asyncio.to_thread(
+                run_check_result,
                 self.settings,
                 only_chat_id=str(chat.id),
+                only_search_id=int(search["id"]),
                 fail_if_running=True,
             )
         except CheckAlreadyRunning:
+            await _delete_message(progress_message)
             await _reply(update, "Проверка уже идет. Попробуйте через пару минут.")
             return
         except RuntimeError as exc:
+            await _delete_message(progress_message)
             await _reply(update, f"Ошибка проверки: {exc}")
             return
+        await _delete_message(progress_message)
         if was_unseeded:
             context.user_data["show_found_after_initial_seed"] = True
-            last_run = self.store.last_check_run()
-            found = last_run["listings_found"] if last_run else 0
+            current_run = self.store.get_check_run(result.run_id) if result.run_id else None
+            found = current_run["listings_found"] if current_run else 0
             await _respond(
                 update,
-                f"Первый запуск: найдено и запомнено текущих объявлений: {found}. "
-                "Дальше будут приходить только новые.",
+                _initial_seed_text(found),
                 _show_found_keyboard(),
             )
             return
-        await _reply(update, f"Проверка завершена. Новых уведомлений: {count}")
+        await _reply(update, f"Проверка завершена. Новых уведомлений: {result.notifications_sent}")
 
     async def admin_status(self, update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
         await _reply(update, _format_admin_status(self.store, self.effective_settings()))
@@ -987,7 +997,7 @@ class SettingsBot:
         )
         await _reply_with_markup(
             update,
-            "Кнопка Настроить поиск теперь доступна снизу.",
+            "Кнопка Меню теперь доступна снизу.",
             _configure_search_reply_keyboard(),
         )
 
@@ -1117,9 +1127,19 @@ def _default_user_search_values(settings: Settings) -> dict[str, object]:
     }
 
 
-async def _reply(update: Update, text: str) -> None:
+async def _reply(update: Update, text: str) -> Message | None:
     if update.effective_message is not None:
-        await update.effective_message.reply_text(text, disable_web_page_preview=True)
+        return await update.effective_message.reply_text(text, disable_web_page_preview=True)
+    return None
+
+
+async def _delete_message(message: Message | None) -> None:
+    if message is None:
+        return
+    try:
+        await message.delete()
+    except TelegramError:
+        logger.debug("Failed to delete Telegram progress message", exc_info=True)
 
 
 async def _reply_with_markup(
@@ -1165,17 +1185,17 @@ def _main_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("Настроить поиск", callback_data="cfg:setup"),
+                InlineKeyboardButton("🔍 Настроить поиск", callback_data="cfg:setup"),
             ],
             [
-                InlineKeyboardButton("Проверить сейчас", callback_data="cfg:check"),
+                InlineKeyboardButton("⚡ Проверить новые квартиры", callback_data="cfg:check"),
             ],
             [
-                InlineKeyboardButton("Мои настройки", callback_data="cfg:settings"),
-                InlineKeyboardButton("Помощь", callback_data="cfg:help"),
+                InlineKeyboardButton("⚙️ Настройки", callback_data="cfg:settings"),
+                InlineKeyboardButton("❓ Как это работает", callback_data="cfg:help"),
             ],
             [
-                InlineKeyboardButton("Остановить поиск", callback_data="cfg:stop"),
+                InlineKeyboardButton("⏸️ Остановить уведомления", callback_data="cfg:stop"),
             ],
         ]
     )
@@ -1192,9 +1212,9 @@ def _start_reply_keyboard() -> ReplyKeyboardMarkup:
 
 def _configure_search_reply_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        [["Настроить поиск"]],
+        [["Меню"]],
         resize_keyboard=True,
-        input_field_placeholder="Можно изменить поиск",
+        input_field_placeholder="Открыть меню",
     )
 
 
@@ -1441,11 +1461,21 @@ def _first_entry_text() -> str:
 def _welcome_text() -> str:
     return "\n".join(
         [
-            "FlatPulse ищет квартиры на ЦИАН и присылает новые объявления.",
+            "🏠 Не проверяйте ЦИАН каждые 10 минут.",
             "",
-            "Начните с настройки поиска. После первой проверки бот запомнит текущую выдачу, "
-            "а дальше будет присылать только новые варианты.",
+            "FlatPulse сам отслеживает новые квартиры и присылает только свежие объявления "
+            "по вашим параметрам.",
+            "",
+            "Настройте поиск один раз — и получайте уведомления, как только появляется "
+            "подходящий вариант.",
         ]
+    )
+
+
+def _initial_seed_text(found: object) -> str:
+    return (
+        f"Первый запуск: запомнил первые объявления из текущей выдачи: {found}. "
+        "Дальше будут приходить только новые."
     )
 
 

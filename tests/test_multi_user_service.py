@@ -209,6 +209,58 @@ def test_manual_check_does_not_wait_between_searches(tmp_path: Path, monkeypatch
     assert sleeps == []
 
 
+def test_manual_check_can_target_one_search_for_chat(tmp_path: Path, monkeypatch) -> None:
+    settings = replace(
+        Settings.from_env(env_file=None),
+        database_path=tmp_path / "test.sqlite3",
+        dry_run=True,
+    )
+    store = ListingStore(settings.database_path)
+    store.init()
+    user_id = store.upsert_user(telegram_chat_id="100")
+    old_search_id = store.create_search(
+        user_id=user_id,
+        title="Старый поиск",
+        city="Казань",
+        region_id="4777",
+        rooms=("1",),
+        min_price=None,
+        max_price=None,
+        rent_type="long",
+        sort_by="creation_date_from_newer_to_older",
+    )
+    new_search_id = store.create_search(
+        user_id=user_id,
+        title="Новый поиск",
+        city="Москва",
+        region_id="1",
+        rooms=("all",),
+        min_price=None,
+        max_price=None,
+        rent_type="all",
+        sort_by="creation_date_from_newer_to_older",
+    )
+    seen_urls: list[str] = []
+
+    def fake_scrape(scraper, _limit):
+        seen_urls.append(scraper.config.search_url)
+        return [_listing("2")]
+
+    monkeypatch.setattr(service, "scrape", fake_scrape)
+
+    result = service.run_check_result(
+        settings,
+        only_chat_id="100",
+        only_search_id=new_search_id,
+    )
+
+    assert result.notifications_sent == 0
+    assert store.search_seen_count(old_search_id) == 0
+    assert store.search_seen_count(new_search_id) == 1
+    assert len(seen_urls) == 1
+    assert "region=1" in seen_urls[0]
+
+
 def test_global_check_does_not_fallback_to_app_settings_when_user_searches_exist(
     tmp_path: Path,
     monkeypatch,

@@ -32,12 +32,16 @@ class TelegramNotifier:
 
     async def send_listings(self, listings: list[Listing]) -> list[str]:
         sent_ids: list[str] = []
-        for listing in listings:
+        for listing in _chat_order(listings):
             await self.send_listing(listing)
             sent_ids.append(listing.cian_id)
             logger.info("Sent listing %s", listing.cian_id)
             await asyncio.sleep(0.4)
         return sent_ids
+
+
+def _chat_order(listings: list[Listing]) -> list[Listing]:
+    return list(reversed(listings))
 
 
 def send_listings_sync(notifier: TelegramNotifier, listings: list[Listing]) -> list[str]:

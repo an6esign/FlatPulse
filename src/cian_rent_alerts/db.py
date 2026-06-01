@@ -301,6 +301,13 @@ class ListingStore:
             ).first()
         return dict(row._mapping) if row is not None else None
 
+    def get_check_run(self, run_id: int) -> dict[str, object] | None:
+        with self.engine.begin() as conn:
+            row = conn.execute(
+                select(check_runs_table).where(check_runs_table.c.id == run_id)
+            ).first()
+        return dict(row._mapping) if row is not None else None
+
     def recent_check_runs(self, limit: int = 5) -> list[dict[str, object]]:
         with self.engine.begin() as conn:
             rows = conn.execute(
@@ -592,9 +599,29 @@ class ListingStore:
         searches = self.searches_for_user(user_id)
         return searches[0] if searches else None
 
+    def current_search_for_user(self, user_id: int) -> dict[str, object] | None:
+        with self.engine.begin() as conn:
+            row = conn.execute(
+                select(searches_table)
+                .where(searches_table.c.user_id == user_id)
+                .order_by(searches_table.c.updated_at.desc(), searches_table.c.id.desc())
+                .limit(1)
+            ).first()
+        return dict(row._mapping) if row is not None else None
+
     def first_active_search_for_user(self, user_id: int) -> dict[str, object] | None:
         searches = self.active_searches_for_user(user_id)
         return searches[0] if searches else None
+
+    def deactivate_other_searches_for_user(self, user_id: int, keep_search_id: int) -> None:
+        with self.engine.begin() as conn:
+            conn.execute(
+                update(searches_table)
+                .where(searches_table.c.user_id == user_id)
+                .where(searches_table.c.id != keep_search_id)
+                .where(searches_table.c.is_active.is_(True))
+                .values(is_active=False, updated_at=utc_now())
+            )
 
     def searches_count(self) -> int:
         return self.searches_count_by_status()
@@ -631,6 +658,15 @@ class ListingStore:
         return [dict(row._mapping) for row in rows]
 
     def active_searches(self) -> list[dict[str, object]]:
+        current_searches = (
+            select(
+                searches_table.c.user_id.label("user_id"),
+                func.max(searches_table.c.id).label("search_id"),
+            )
+            .where(searches_table.c.is_active.is_(True))
+            .group_by(searches_table.c.user_id)
+            .subquery()
+        )
         with self.engine.begin() as conn:
             rows = conn.execute(
                 select(
@@ -655,7 +691,13 @@ class ListingStore:
                     searches_table.c.cooldown_until.label("cooldown_until"),
                     users_table.c.telegram_chat_id.label("telegram_chat_id"),
                 )
-                .select_from(searches_table.join(users_table))
+                .select_from(
+                    searches_table.join(users_table).join(
+                        current_searches,
+                        (current_searches.c.user_id == searches_table.c.user_id)
+                        & (current_searches.c.search_id == searches_table.c.id),
+                    )
+                )
                 .where(searches_table.c.is_active.is_(True))
                 .where(users_table.c.is_active.is_(True))
                 .where(

@@ -298,6 +298,59 @@ def test_global_check_does_not_fallback_to_app_settings_when_user_searches_exist
     assert service.run_check(settings) == 0
 
 
+def test_scheduled_check_does_not_use_global_fallback_without_user_searches(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    settings = replace(
+        Settings.from_env(env_file=None),
+        database_path=tmp_path / "test.sqlite3",
+        telegram_chat_id="primary-chat",
+        dry_run=False,
+        telegram_bot_token="token",
+    )
+    store = ListingStore(settings.database_path)
+    store.init()
+
+    monkeypatch.setattr(
+        service,
+        "build_scraper",
+        lambda _settings: (_ for _ in ()).throw(AssertionError("should not scrape")),
+    )
+
+    result = service.run_check_result(settings)
+    last_run = store.last_check_run()
+
+    assert result.notifications_sent == 0
+    assert last_run is not None
+    assert last_run["listings_found"] == 0
+    assert last_run["notifications_sent"] == 0
+
+
+def test_explicit_global_fallback_still_supports_once_mode(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    settings = replace(
+        Settings.from_env(env_file=None),
+        database_path=tmp_path / "test.sqlite3",
+        telegram_chat_id="primary-chat",
+        dry_run=True,
+    )
+    store = ListingStore(settings.database_path)
+    store.init()
+
+    monkeypatch.setattr(service, "build_scraper", lambda _settings: object())
+    monkeypatch.setattr(service, "scrape", lambda _scraper, _limit: [_listing("1")])
+
+    result = service.run_check_result(settings, allow_global_fallback=True)
+    last_run = store.last_check_run()
+
+    assert result.notifications_sent == 1
+    assert last_run is not None
+    assert last_run["listings_found"] == 1
+
+
 def test_scrape_with_fallback_retries_playwright_on_empty_parse(monkeypatch) -> None:
     settings = replace(
         Settings.from_env(env_file=None),
@@ -728,6 +781,163 @@ def test_partial_check_does_not_notify_admins_in_dry_run(
     assert service.run_check(settings) == 0
 
     assert sent_messages == []
+
+
+def test_no_new_listings_nudge_is_sent_once_per_day(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    settings = replace(
+        Settings.from_env(env_file=None),
+        database_path=tmp_path / "test.sqlite3",
+        dry_run=False,
+        telegram_bot_token="token",
+    )
+    store = ListingStore(settings.database_path)
+    store.init()
+    user_id = store.upsert_user(telegram_chat_id="100")
+    search_id = store.create_search(
+        user_id=user_id,
+        title="Основной поиск",
+        city="Москва",
+        region_id="1",
+        rooms=("all",),
+        min_price=None,
+        max_price=None,
+        rent_type="all",
+        sort_by="creation_date_from_newer_to_older",
+    )
+    batches = [
+        [_listing("1")],
+        [_listing("1")],
+        [_listing("1")],
+    ]
+    sent_messages: list[tuple[str, object]] = []
+
+    monkeypatch.setattr(service, "build_scraper", lambda _settings: object())
+    monkeypatch.setattr(service, "scrape", lambda _scraper, _limit: batches.pop(0))
+    monkeypatch.setattr(
+        service,
+        "send_message_sync",
+        lambda _notifier, text, reply_markup=None: sent_messages.append((text, reply_markup)),
+    )
+
+    assert service.run_check(settings) == 0
+    store.set_user_state(
+        user_id,
+        service._last_new_listing_state_key(search_id),
+        (datetime.now(UTC) - timedelta(hours=25)).isoformat(timespec="seconds"),
+    )
+
+    assert service.run_check(settings) == 0
+    assert service.run_check(settings) == 0
+
+    assert len(sent_messages) == 1
+    text, reply_markup = sent_messages[0]
+    assert "За последние 24 часа" in text
+    assert "расширить поиск" in text
+    assert reply_markup is not None
+    assert reply_markup.inline_keyboard[0][0].text == "⚙️ Настроить фильтры"
+
+
+def test_active_trial_allows_new_listing_notifications(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    settings = replace(
+        Settings.from_env(env_file=None),
+        database_path=tmp_path / "test.sqlite3",
+        dry_run=False,
+        telegram_bot_token="token",
+    )
+    store = ListingStore(settings.database_path)
+    store.init()
+    user_id = store.upsert_user(telegram_chat_id="100")
+    search_id = store.create_search(
+        user_id=user_id,
+        title="Основной поиск",
+        city="Москва",
+        region_id="1",
+        rooms=("all",),
+        min_price=None,
+        max_price=None,
+        rent_type="all",
+        sort_by="creation_date_from_newer_to_older",
+    )
+    store.upsert_many([_listing("1")])
+    store.mark_search_listing_seen(search_id=search_id, cian_id="1", sent=False)
+    store.update_search(search_id, initialized_at=datetime.now(UTC).isoformat(timespec="seconds"))
+    store.start_trial_if_needed(user_id, days=7)
+    sent_batches: list[list[str]] = []
+
+    monkeypatch.setattr(service, "build_scraper", lambda _settings: object())
+    monkeypatch.setattr(service, "scrape", lambda _scraper, _limit: [_listing("1"), _listing("2")])
+    monkeypatch.setattr(
+        service,
+        "send_listings_sync",
+        lambda _notifier, listings: (
+            sent_batches.append([item.cian_id for item in listings])
+            or [item.cian_id for item in listings]
+        ),
+    )
+
+    assert service.run_check(settings) == 1
+
+    assert sent_batches == [["2"]]
+    assert store.search_seen_count(search_id) == 2
+
+
+def test_expired_access_blocks_notifications_without_marking_seen(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    settings = replace(
+        Settings.from_env(env_file=None),
+        database_path=tmp_path / "test.sqlite3",
+        dry_run=False,
+        telegram_bot_token="token",
+    )
+    store = ListingStore(settings.database_path)
+    store.init()
+    user_id = store.upsert_user(telegram_chat_id="100")
+    search_id = store.create_search(
+        user_id=user_id,
+        title="Основной поиск",
+        city="Москва",
+        region_id="1",
+        rooms=("all",),
+        min_price=None,
+        max_price=None,
+        rent_type="all",
+        sort_by="creation_date_from_newer_to_older",
+    )
+    store.upsert_many([_listing("1")])
+    store.mark_search_listing_seen(search_id=search_id, cian_id="1", sent=False)
+    store.update_search(search_id, initialized_at=datetime.now(UTC).isoformat(timespec="seconds"))
+    sent_messages: list[tuple[str, object]] = []
+
+    monkeypatch.setattr(service, "build_scraper", lambda _settings: object())
+    monkeypatch.setattr(service, "scrape", lambda _scraper, _limit: [_listing("1"), _listing("2")])
+    monkeypatch.setattr(
+        service,
+        "send_listings_sync",
+        lambda _notifier, _listings: (_ for _ in ()).throw(
+            AssertionError("should not send listings")
+        ),
+    )
+    monkeypatch.setattr(
+        service,
+        "send_message_sync",
+        lambda _notifier, text, reply_markup=None: sent_messages.append((text, reply_markup)),
+    )
+
+    assert service.run_check(settings) == 0
+
+    assert store.search_seen_count(search_id) == 1
+    assert len(sent_messages) == 1
+    text, reply_markup = sent_messages[0]
+    assert "Пробный период закончился" in text
+    assert reply_markup.inline_keyboard[0][0].callback_data == "cfg:subscribe"
 
 
 def test_run_check_skips_when_another_check_is_running(tmp_path: Path) -> None:

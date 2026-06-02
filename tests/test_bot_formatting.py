@@ -4,6 +4,8 @@ from cian_rent_alerts.bot import (
     SHOW_FOUND_LIMIT,
     _configure_search_reply_keyboard,
     _default_user_search_values,
+    _dev_payment_screen_keyboard,
+    _dev_payment_screen_text,
     _first_entry_text,
     _format_area,
     _format_radius_label,
@@ -18,6 +20,8 @@ from cian_rent_alerts.bot import (
     _start_reply_keyboard,
     _stopped_search_keyboard,
     _welcome_text,
+    _show_found_keyboard,
+    _search_settings_keyboard,
 )
 from cian_rent_alerts.config import ConfigError, Settings
 
@@ -62,18 +66,47 @@ def test_main_keyboard_starts_with_clear_user_actions() -> None:
 
     assert keyboard[0][0].text == "🔍 Настроить поиск"
     assert keyboard[0][0].callback_data == "cfg:setup"
-    assert keyboard[1][0].text == "⚡ Проверить новые квартиры"
-    assert keyboard[2][0].text == "⚙️ Настройки"
+    assert keyboard[1][0].text == "🔍 Найти квартиры сейчас"
+    assert keyboard[2][0].text == "⚙️ Настройки поиска"
     assert keyboard[2][1].text == "❓ Как это работает"
-    assert keyboard[3][0].text == "⏸️ Остановить уведомления"
-    assert keyboard[3][0].callback_data == "cfg:stop"
 
 
 def test_stopped_search_keyboard_has_resume_action() -> None:
     keyboard = _stopped_search_keyboard().inline_keyboard
 
-    assert keyboard[0][0].text == "Возобновить поиск"
+    assert keyboard[0][0].text == "Возобновить мониторинг"
     assert keyboard[0][0].callback_data == "cfg:resume"
+
+
+def test_search_settings_keyboard_has_pause_and_delete_actions() -> None:
+    keyboard = _search_settings_keyboard().inline_keyboard
+
+    assert keyboard[0][0].text == "Изменить параметры"
+    assert keyboard[1][0].text == "Оформить подписку"
+    assert keyboard[1][0].callback_data == "cfg:subscribe"
+    assert keyboard[2][0].text == "Приостановить мониторинг"
+    assert keyboard[2][0].callback_data == "cfg:stop"
+    assert keyboard[3][0].text == "Удалить поиск"
+    assert keyboard[3][0].callback_data == "cfg:delete"
+
+
+def test_show_found_keyboard_uses_user_facing_copy() -> None:
+    keyboard = _show_found_keyboard().inline_keyboard
+
+    assert keyboard[0][0].text == "👀 Посмотреть найденные квартиры"
+    assert keyboard[0][0].callback_data == "cfg:show_found"
+
+
+def test_dev_payment_screen_has_required_yookassa_moderation_content() -> None:
+    settings = Settings.from_env(env_file=None)
+    text = _dev_payment_screen_text(settings)
+    keyboard = _dev_payment_screen_keyboard().inline_keyboard
+
+    assert "FlatPulse" in text
+    assert "Подписка" in text
+    assert "199 ₽" in text
+    assert keyboard[0][0].text == "Оформить заказ"
+    assert keyboard[0][0].callback_data == "cfg:subscribe"
 
 
 def test_format_settings_can_show_search_status() -> None:
@@ -81,7 +114,7 @@ def test_format_settings_can_show_search_status() -> None:
 
     text = _format_settings(settings, status="остановлен")
 
-    assert "Статус: остановлен" in text
+    assert "Поиск: остановлен" in text
 
 
 def test_welcome_text_explains_first_action() -> None:
@@ -95,7 +128,8 @@ def test_welcome_text_explains_first_action() -> None:
 def test_initial_seed_text_does_not_claim_total_found_count() -> None:
     text = _initial_seed_text(28)
 
-    assert "первые объявления из текущей выдачи: 28" in text
+    assert "Мониторинг запущен" in text
+    assert "Уже найдено: 28 квартир" in text
     assert "найдено и запомнено" not in text
 
 
@@ -103,9 +137,9 @@ def test_first_entry_uses_start_reply_button() -> None:
     text = _first_entry_text()
     keyboard = _start_reply_keyboard().keyboard
 
-    assert "Нажмите Начать" in text
-    assert "Сейчас поиск работает по ЦИАН" in text
-    assert keyboard[0][0].text == "Начать"
+    assert "FlatPulse следит за ЦИАН" in text
+    assert "Начнем?" in text
+    assert keyboard[0][0].text == "🔍 Настроить поиск"
 
 
 def test_configure_search_reply_button_is_persistent() -> None:

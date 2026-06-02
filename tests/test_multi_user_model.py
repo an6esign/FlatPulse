@@ -1,6 +1,9 @@
 from pathlib import Path
+from datetime import UTC, datetime, timedelta
 
-from cian_rent_alerts.db import ListingStore
+from sqlalchemy import update
+
+from cian_rent_alerts.db import ListingStore, users_table
 from cian_rent_alerts.models import Listing
 
 
@@ -98,6 +101,38 @@ def test_user_state_flow(tmp_path: Path) -> None:
 
     store.delete_user_state(user_id, "awaiting")
     assert store.get_user_state(user_id, "awaiting") is None
+
+
+def test_trial_and_paid_access_flow(tmp_path: Path) -> None:
+    store = ListingStore(tmp_path / "test.sqlite3")
+    store.init()
+    user_id = store.upsert_user(telegram_chat_id="100")
+
+    assert store.user_has_active_access(user_id) is False
+
+    user = store.start_trial_if_needed(user_id, days=7)
+    assert user is not None
+    assert user["trial_started_at"] is not None
+    assert user["trial_ends_at"] is not None
+    assert store.user_has_active_access(user_id) is True
+
+    same_trial = store.start_trial_if_needed(user_id, days=7)
+    assert same_trial is not None
+    assert same_trial["trial_started_at"] == user["trial_started_at"]
+
+    expired_at = (datetime.now(UTC) - timedelta(days=1)).isoformat(timespec="seconds")
+    with store.engine.begin() as conn:
+        conn.execute(
+            update(users_table)
+            .where(users_table.c.id == user_id)
+            .values(trial_ends_at=expired_at, subscription_status="expired")
+        )
+    assert store.user_has_active_access(user_id) is False
+
+    paid_until = store.grant_paid_access(user_id, days=31)
+    assert paid_until is not None
+    assert store.user_has_active_access(user_id) is True
+    assert store.user_has_active_paid_access(user_id) is True
 
 
 def test_current_search_for_user_uses_latest_and_can_deactivate_older(

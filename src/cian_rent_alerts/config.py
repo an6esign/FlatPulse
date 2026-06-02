@@ -112,6 +112,12 @@ class Settings:
     playwright_headless: bool
     environment: str
     prod_telegram_bot_token_hash: str | None
+    yookassa_shop_id: str | None
+    yookassa_secret_key: str | None
+    yookassa_return_url: str | None
+    subscription_price_rub: int
+    subscription_period_days: int
+    trial_days: int
 
     @classmethod
     def from_env(cls, env_file: Path | None = Path(".env")) -> "Settings":
@@ -160,6 +166,12 @@ class Settings:
             playwright_headless=_as_bool(os.getenv("PLAYWRIGHT_HEADLESS"), True),
             environment=os.getenv("ENVIRONMENT", "prod").strip().lower(),
             prod_telegram_bot_token_hash=os.getenv("PROD_TELEGRAM_BOT_TOKEN_HASH") or None,
+            yookassa_shop_id=os.getenv("YOOKASSA_SHOP_ID") or None,
+            yookassa_secret_key=os.getenv("YOOKASSA_SECRET_KEY") or None,
+            yookassa_return_url=os.getenv("YOOKASSA_RETURN_URL") or None,
+            subscription_price_rub=max(_as_int("SUBSCRIPTION_PRICE_RUB", 199), 1),
+            subscription_period_days=max(_as_int("SUBSCRIPTION_PERIOD_DAYS", 31), 1),
+            trial_days=max(_as_int("TRIAL_DAYS", 7), 0),
         )
 
     def validate_environment(self) -> None:

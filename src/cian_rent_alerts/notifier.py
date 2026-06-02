@@ -4,6 +4,9 @@ import asyncio
 import logging
 
 from telegram import Bot
+from telegram import InlineKeyboardMarkup
+from telegram import ReplyKeyboardMarkup
+from telegram import ReplyKeyboardRemove
 
 from .models import Listing
 
@@ -23,11 +26,16 @@ class TelegramNotifier:
         text: str,
         *,
         disable_web_page_preview: bool = True,
+        reply_markup: InlineKeyboardMarkup
+        | ReplyKeyboardMarkup
+        | ReplyKeyboardRemove
+        | None = None,
     ) -> None:
         await self.bot.send_message(
             chat_id=self.chat_id,
             text=text,
             disable_web_page_preview=disable_web_page_preview,
+            reply_markup=reply_markup,
         )
 
     async def send_listings(self, listings: list[Listing]) -> list[str]:
@@ -48,5 +56,10 @@ def send_listings_sync(notifier: TelegramNotifier, listings: list[Listing]) -> l
     return asyncio.run(notifier.send_listings(listings))
 
 
-def send_message_sync(notifier: TelegramNotifier, text: str) -> None:
-    asyncio.run(notifier.send_message(text))
+def send_message_sync(
+    notifier: TelegramNotifier,
+    text: str,
+    *,
+    reply_markup: InlineKeyboardMarkup | ReplyKeyboardMarkup | ReplyKeyboardRemove | None = None,
+) -> None:
+    asyncio.run(notifier.send_message(text, reply_markup=reply_markup))

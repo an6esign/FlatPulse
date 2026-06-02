@@ -9,6 +9,7 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Mapping
 
 import requests
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import TelegramError
 
 from .cian_url import build_cian_search_url
@@ -28,6 +29,8 @@ from .scraper import (
 
 logger = logging.getLogger(__name__)
 _CHECK_LOCK = threading.Lock()
+_NO_NEW_LISTINGS_NUDGE_AFTER = timedelta(hours=24)
+_PAYMENT_REQUIRED_NOTICE_COOLDOWN = timedelta(hours=24)
 
 
 class CheckAlreadyRunning(RuntimeError):
@@ -180,12 +183,14 @@ def run_check(
     only_chat_id: str | None = None,
     only_search_id: int | None = None,
     fail_if_running: bool = False,
+    allow_global_fallback: bool = False,
 ) -> int:
     return run_check_result(
         settings,
         only_chat_id=only_chat_id,
         only_search_id=only_search_id,
         fail_if_running=fail_if_running,
+        allow_global_fallback=allow_global_fallback,
     ).notifications_sent
 
 
@@ -195,6 +200,7 @@ def run_check_result(
     only_chat_id: str | None = None,
     only_search_id: int | None = None,
     fail_if_running: bool = False,
+    allow_global_fallback: bool = False,
 ) -> CheckRunResult:
     if not _CHECK_LOCK.acquire(blocking=False):
         logger.info("Check is already running, skipping new request")
@@ -202,7 +208,12 @@ def run_check_result(
             raise CheckAlreadyRunning("Проверка уже выполняется")
         return CheckRunResult(run_id=None, notifications_sent=0)
     try:
-        return _run_check(settings, only_chat_id=only_chat_id, only_search_id=only_search_id)
+        return _run_check(
+            settings,
+            only_chat_id=only_chat_id,
+            only_search_id=only_search_id,
+            allow_global_fallback=allow_global_fallback,
+        )
     finally:
         _CHECK_LOCK.release()
 
@@ -212,6 +223,7 @@ def _run_check(
     *,
     only_chat_id: str | None = None,
     only_search_id: int | None = None,
+    allow_global_fallback: bool = False,
 ) -> CheckRunResult:
     store = ListingStore(settings.database_path, settings.database_url)
     store.init()
@@ -251,7 +263,7 @@ def _run_check(
                     notifications_sent=0,
                 )
                 return CheckRunResult(run_id=run_id, notifications_sent=0)
-            if not settings.telegram_chat_id:
+            if not allow_global_fallback or not settings.telegram_chat_id:
                 logger.info("No active searches to check")
                 store.finish_check_run(
                     run_id,
@@ -296,6 +308,7 @@ def _run_check(
                         cian_ids=[listing.cian_id for listing in listings],
                         sent=False,
                     )
+                    _remember_search_activity_checkpoint(store, search)
                     logger.info(
                         "Seeded %s existing listings for search_id=%s", len(listings), search_id
                     )
@@ -304,6 +317,13 @@ def _run_check(
                 unseen = store.unseen_listings_for_search(search_id, listings)
                 new_listings += len(unseen)
                 if not unseen:
+                    _maybe_notify_no_new_listings(store, search_settings, search)
+                    continue
+
+                if not search_settings.dry_run and not store.user_has_active_access(
+                    int(search["user_id"])
+                ):
+                    _maybe_notify_payment_required(store, search_settings, search)
                     continue
 
                 if search_settings.dry_run:
@@ -318,6 +338,7 @@ def _run_check(
                         cian_ids=[listing.cian_id for listing in unseen],
                         sent=False,
                     )
+                    _remember_search_activity_checkpoint(store, search)
                     continue
 
                 notifier = TelegramNotifier(
@@ -331,6 +352,8 @@ def _run_check(
                     cian_ids=sent_ids,
                     sent=True,
                 )
+                if sent_ids:
+                    _remember_search_activity_checkpoint(store, search)
             except Exception as exc:
                 error_type = classify_check_error(exc)
                 store.record_search_error(
@@ -555,6 +578,166 @@ def _should_notify_admins_about_check_problem(*, status: str, error: str) -> boo
         error_line.startswith(("empty_parse:", "captcha:"))
         for error_line in error.splitlines()
         if error_line
+    )
+
+
+def _remember_search_activity_checkpoint(
+    store: ListingStore,
+    search: Mapping[str, object],
+    *,
+    now: datetime | None = None,
+) -> None:
+    now = now or datetime.now(UTC)
+    user_id = int(search["user_id"])
+    search_id = int(search["id"])
+    store.set_user_state(
+        user_id,
+        _last_new_listing_state_key(search_id),
+        now.isoformat(timespec="seconds"),
+    )
+    store.delete_user_state(user_id, _no_new_nudge_state_key(search_id))
+
+
+def _maybe_notify_no_new_listings(
+    store: ListingStore,
+    settings: Settings,
+    search: Mapping[str, object],
+    *,
+    now: datetime | None = None,
+) -> None:
+    if settings.dry_run or not settings.telegram_bot_token:
+        return
+
+    now = now or datetime.now(UTC)
+    user_id = int(search["user_id"])
+    search_id = int(search["id"])
+    last_activity = _parse_state_datetime(
+        store.get_user_state(user_id, _last_new_listing_state_key(search_id))
+    )
+    if last_activity is None:
+        _remember_search_activity_checkpoint(store, search, now=now)
+        return
+    if now - last_activity < _NO_NEW_LISTINGS_NUDGE_AFTER:
+        return
+
+    last_nudge = _parse_state_datetime(
+        store.get_user_state(user_id, _no_new_nudge_state_key(search_id))
+    )
+    if last_nudge is not None and now - last_nudge < _NO_NEW_LISTINGS_NUDGE_AFTER:
+        return
+
+    try:
+        notifier = TelegramNotifier(
+            token=settings.telegram_bot_token,
+            chat_id=str(search["telegram_chat_id"]),
+        )
+        send_message_sync(
+            notifier,
+            _no_new_listings_nudge_text(),
+            reply_markup=_no_new_listings_nudge_keyboard(),
+        )
+        store.set_user_state(
+            user_id,
+            _no_new_nudge_state_key(search_id),
+            now.isoformat(timespec="seconds"),
+        )
+    except Exception:
+        logger.exception("Failed to send no-new-listings nudge for search_id=%s", search_id)
+
+
+def _maybe_notify_payment_required(
+    store: ListingStore,
+    settings: Settings,
+    search: Mapping[str, object],
+    *,
+    now: datetime | None = None,
+) -> None:
+    if settings.dry_run or not settings.telegram_bot_token:
+        return
+
+    now = now or datetime.now(UTC)
+    user_id = int(search["user_id"])
+    search_id = int(search["id"])
+    last_notice = _parse_state_datetime(
+        store.get_user_state(user_id, _payment_required_notice_state_key(search_id))
+    )
+    if last_notice is not None and now - last_notice < _PAYMENT_REQUIRED_NOTICE_COOLDOWN:
+        return
+
+    try:
+        notifier = TelegramNotifier(
+            token=settings.telegram_bot_token,
+            chat_id=str(search["telegram_chat_id"]),
+        )
+        send_message_sync(
+            notifier,
+            _payment_required_text(settings),
+            reply_markup=_payment_required_keyboard(),
+        )
+        store.set_user_state(
+            user_id,
+            _payment_required_notice_state_key(search_id),
+            now.isoformat(timespec="seconds"),
+        )
+    except Exception:
+        logger.exception("Failed to send payment-required notice for search_id=%s", search_id)
+
+
+def _last_new_listing_state_key(search_id: int) -> str:
+    return f"last_new_listing_at:{search_id}"
+
+
+def _no_new_nudge_state_key(search_id: int) -> str:
+    return f"no_new_nudge_at:{search_id}"
+
+
+def _payment_required_notice_state_key(search_id: int) -> str:
+    return f"payment_required_notice_at:{search_id}"
+
+
+def _parse_state_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed
+
+
+def _no_new_listings_nudge_text() -> str:
+    return "\n".join(
+        [
+            "📉 За последние 24 часа по вашим параметрам не появилось ни одного нового объявления.",
+            "",
+            "Хотите получать больше вариантов?",
+            "",
+            "Попробуйте немного расширить поиск.",
+        ]
+    )
+
+
+def _no_new_listings_nudge_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("⚙️ Настроить фильтры", callback_data="cfg:setup")]]
+    )
+
+
+def _payment_required_text(settings: Settings) -> str:
+    return "\n".join(
+        [
+            "Пробный период закончился.",
+            "",
+            f"Чтобы продолжить получать новые квартиры, оформите подписку за {settings.subscription_price_rub} ₽ в месяц.",
+        ]
+    )
+
+
+def _payment_required_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Оформить подписку", callback_data="cfg:subscribe")]]
     )
 
 

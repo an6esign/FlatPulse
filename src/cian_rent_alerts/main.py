@@ -84,7 +84,7 @@ def main(argv: list[str] | None = None) -> int:
             return run_healthcheck(settings)
 
         if args.once:
-            count = run_check(settings)
+            count = run_check(settings, allow_global_fallback=True)
             logging.info("Done, notified %s listings", count)
             return 0
 

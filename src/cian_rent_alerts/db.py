@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Iterable
 
@@ -85,8 +85,14 @@ users_table = Table(
     Column("last_seen_at", String(40), nullable=False),
     Column("is_admin", Boolean, nullable=False, default=False),
     Column("is_active", Boolean, nullable=False, default=True),
+    Column("trial_started_at", String(40)),
+    Column("trial_ends_at", String(40)),
+    Column("paid_until", String(40)),
+    Column("subscription_status", Text, nullable=False, default="none"),
 )
 Index("idx_users_telegram_chat_id", users_table.c.telegram_chat_id)
+Index("idx_users_trial_ends_at", users_table.c.trial_ends_at)
+Index("idx_users_paid_until", users_table.c.paid_until)
 
 user_states_table = Table(
     "user_states",
@@ -135,6 +141,24 @@ search_seen_listings_table = Table(
     Column("sent_at", String(40)),
 )
 Index("idx_search_seen_sent_at", search_seen_listings_table.c.sent_at)
+
+payments_table = Table(
+    "payments",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("user_id", Integer, ForeignKey("users.id"), nullable=False),
+    Column("provider", Text, nullable=False),
+    Column("provider_payment_id", Text, nullable=False, unique=True),
+    Column("status", Text, nullable=False),
+    Column("amount_rub", Integer, nullable=False),
+    Column("confirmation_url", Text),
+    Column("paid_until", String(40)),
+    Column("raw_json", Text, nullable=False, default="{}"),
+    Column("created_at", String(40), nullable=False),
+    Column("updated_at", String(40), nullable=False),
+)
+Index("idx_payments_user_id", payments_table.c.user_id)
+Index("idx_payments_provider_payment_id", payments_table.c.provider_payment_id)
 
 
 class ListingStore:
@@ -405,6 +429,7 @@ class ListingStore:
                     last_seen_at=now,
                     is_admin=is_admin,
                     is_active=True,
+                    subscription_status="none",
                 )
             )
             return int(result.inserted_primary_key[0])
@@ -413,6 +438,132 @@ class ListingStore:
         with self.engine.begin() as conn:
             row = conn.execute(
                 select(users_table).where(users_table.c.telegram_chat_id == telegram_chat_id)
+            ).first()
+        return dict(row._mapping) if row is not None else None
+
+    def get_user(self, user_id: int) -> dict[str, object] | None:
+        with self.engine.begin() as conn:
+            row = conn.execute(select(users_table).where(users_table.c.id == user_id)).first()
+        return dict(row._mapping) if row is not None else None
+
+    def start_trial_if_needed(self, user_id: int, *, days: int) -> dict[str, object] | None:
+        user = self.get_user(user_id)
+        if user is None:
+            return None
+        if user.get("trial_started_at") or self.user_has_active_paid_access(user_id):
+            return user
+
+        now = datetime.now(UTC)
+        trial_ends_at = now + timedelta(days=days)
+        with self.engine.begin() as conn:
+            conn.execute(
+                update(users_table)
+                .where(users_table.c.id == user_id)
+                .values(
+                    trial_started_at=now.isoformat(timespec="seconds"),
+                    trial_ends_at=trial_ends_at.isoformat(timespec="seconds"),
+                    subscription_status="trial",
+                    last_seen_at=now.isoformat(timespec="seconds"),
+                )
+            )
+        return self.get_user(user_id)
+
+    def user_has_active_access(self, user_id: int) -> bool:
+        user = self.get_user(user_id)
+        if user is None:
+            return False
+        if bool(user.get("is_admin")):
+            return True
+        now = datetime.now(UTC)
+        trial_ends_at = _parse_datetime(user.get("trial_ends_at"))
+        if trial_ends_at is not None and trial_ends_at > now:
+            return True
+        paid_until = _parse_datetime(user.get("paid_until"))
+        return paid_until is not None and paid_until > now
+
+    def user_has_active_paid_access(self, user_id: int) -> bool:
+        user = self.get_user(user_id)
+        if user is None:
+            return False
+        paid_until = _parse_datetime(user.get("paid_until"))
+        return paid_until is not None and paid_until > datetime.now(UTC)
+
+    def grant_paid_access(self, user_id: int, *, days: int) -> str | None:
+        user = self.get_user(user_id)
+        if user is None:
+            return None
+        now = datetime.now(UTC)
+        current_paid_until = _parse_datetime(user.get("paid_until"))
+        starts_at = current_paid_until if current_paid_until and current_paid_until > now else now
+        paid_until = starts_at + timedelta(days=days)
+        value = paid_until.isoformat(timespec="seconds")
+        with self.engine.begin() as conn:
+            conn.execute(
+                update(users_table)
+                .where(users_table.c.id == user_id)
+                .values(
+                    paid_until=value,
+                    subscription_status="paid",
+                    last_seen_at=now.isoformat(timespec="seconds"),
+                )
+            )
+        return value
+
+    def create_payment(
+        self,
+        *,
+        user_id: int,
+        provider_payment_id: str,
+        status: str,
+        amount_rub: int,
+        confirmation_url: str | None,
+        raw_json: str,
+    ) -> int:
+        now = utc_now()
+        with self.engine.begin() as conn:
+            result = conn.execute(
+                insert(payments_table).values(
+                    user_id=user_id,
+                    provider="yookassa",
+                    provider_payment_id=provider_payment_id,
+                    status=status,
+                    amount_rub=amount_rub,
+                    confirmation_url=confirmation_url,
+                    raw_json=raw_json,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            return int(result.inserted_primary_key[0])
+
+    def update_payment(
+        self,
+        provider_payment_id: str,
+        *,
+        status: str,
+        paid_until: str | None = None,
+        raw_json: str | None = None,
+    ) -> None:
+        values: dict[str, object] = {"status": status, "updated_at": utc_now()}
+        if paid_until is not None:
+            values["paid_until"] = paid_until
+        if raw_json is not None:
+            values["raw_json"] = raw_json
+        with self.engine.begin() as conn:
+            conn.execute(
+                update(payments_table)
+                .where(payments_table.c.provider_payment_id == provider_payment_id)
+                .values(**values)
+            )
+
+    def latest_pending_payment_for_user(self, user_id: int) -> dict[str, object] | None:
+        with self.engine.begin() as conn:
+            row = conn.execute(
+                select(payments_table)
+                .where(payments_table.c.user_id == user_id)
+                .where(payments_table.c.status.in_(["pending", "waiting_for_capture"]))
+                .order_by(payments_table.c.created_at.desc(), payments_table.c.id.desc())
+                .limit(1)
             ).first()
         return dict(row._mapping) if row is not None else None
 
@@ -870,3 +1021,15 @@ def _normalize_database_url(database_url: str) -> str:
     if database_url.startswith("postgresql://"):
         return database_url.replace("postgresql://", "postgresql+psycopg://", 1)
     return database_url
+
+
+def _parse_datetime(value: object) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed

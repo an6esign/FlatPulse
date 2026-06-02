@@ -123,6 +123,9 @@ class SettingsBot:
         application.add_handler(
             CommandHandler("dev_payment_screen", self._admin_only(self.dev_payment_screen))
         )
+        application.add_handler(
+            CommandHandler("payment_screen", self._admin_only(self.payment_screen))
+        )
         application.add_handler(CommandHandler("check", self._authorized(self.check)))
         application.add_handler(
             MessageHandler(
@@ -702,6 +705,9 @@ class SettingsBot:
     async def dev_payment_screen(self, update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
         if self.settings.environment != "dev":
             return
+        await self.payment_screen(update, _context)
+
+    async def payment_screen(self, update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
         await _respond(
             update,
             _dev_payment_screen_text(self.settings),

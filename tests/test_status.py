@@ -3,6 +3,7 @@ from dataclasses import replace
 
 from cian_rent_alerts.bot import (
     _format_admin_health,
+    _format_admin_metrics,
     _format_admin_report,
     _format_admin_searches,
     _format_admin_status,
@@ -11,6 +12,7 @@ from cian_rent_alerts.bot import (
 )
 from cian_rent_alerts.config import Settings
 from cian_rent_alerts.db import ListingStore
+from cian_rent_alerts.analytics import EV_MANUAL_CHECK, EV_TRIAL_STARTED
 
 
 def test_store_last_check_run(tmp_path: Path) -> None:
@@ -25,6 +27,10 @@ def test_store_last_check_run(tmp_path: Path) -> None:
         listings_saved=10,
         new_listings=2,
         notifications_sent=2,
+        active_searches=4,
+        unique_search_groups=2,
+        cian_fetches=2,
+        shared_group_hits=2,
     )
 
     last_run = store.last_check_run()
@@ -34,6 +40,10 @@ def test_store_last_check_run(tmp_path: Path) -> None:
     assert last_run["listings_found"] == 10
     assert last_run["new_listings"] == 2
     assert last_run["notifications_sent"] == 2
+    assert last_run["active_searches"] == 4
+    assert last_run["unique_search_groups"] == 2
+    assert last_run["cian_fetches"] == 2
+    assert last_run["shared_group_hits"] == 2
 
 
 def test_recent_failed_check_runs(tmp_path: Path) -> None:
@@ -140,6 +150,7 @@ def test_admin_monitoring_counts_and_formatters(tmp_path: Path) -> None:
         parser_network_cooldown_seconds=900,
     )
     health_text = _format_admin_health(store, health_settings)
+    status_text = _format_admin_status(store, health_settings)
     report_text = _format_admin_report(store, health_settings)
 
     assert "chat=100" in users_text
@@ -148,6 +159,8 @@ def test_admin_monitoring_counts_and_formatters(tmp_path: Path) -> None:
     assert "Москва" in searches_text
     assert "Admin health" in health_text
     assert "DB: ok" in health_text
+    assert "Last groups:" in health_text
+    assert "Groups:" in status_text
     assert "Health: degraded" in health_text
     assert "partial=1" in health_text
     assert "Parser: requests+playwright_fallback, retry=3 backoff=2 sec" in health_text
@@ -159,6 +172,49 @@ def test_admin_monitoring_counts_and_formatters(tmp_path: Path) -> None:
     assert "Admin searches" in report_text
     assert "Последние проверки" in report_text
     assert "Последние ошибки" in report_text
+
+
+def test_format_admin_metrics(tmp_path: Path) -> None:
+    store = ListingStore(tmp_path / "test.sqlite3")
+    store.init()
+    user_id = store.upsert_user(telegram_chat_id="100")
+    search_id = store.create_search(
+        user_id=user_id,
+        title="Основной поиск",
+        city="Москва",
+        region_id="1",
+        rooms=("all",),
+        min_price=None,
+        max_price=None,
+        rent_type="all",
+        sort_by="creation_date_from_newer_to_older",
+    )
+    run_id = store.start_check_run()
+    store.finish_check_run(
+        run_id,
+        status="success",
+        listings_found=12,
+        new_listings=3,
+        notifications_sent=3,
+        active_searches=2,
+        unique_search_groups=1,
+        cian_fetches=1,
+        shared_group_hits=1,
+    )
+    store.record_event(EV_MANUAL_CHECK, user_id=user_id, search_id=search_id)
+    store.record_event(EV_TRIAL_STARTED, user_id=user_id, search_id=search_id)
+
+    text = _format_admin_metrics(store)
+
+    assert "Metrics 24h" in text
+    assert "users_total: 1" in text
+    assert "searches_active: 1" in text
+    assert "trial_started: 1" in text
+    assert "manual_checks: 1" in text
+    assert "listings_found: 12" in text
+    assert "new_listings_sent: 3" in text
+    assert "groups: active=2 unique=1 fetches=1 shared=1" in text
+    assert "/start: 0" in text
 
 
 def test_schema_version_is_unknown_without_alembic_table(tmp_path: Path) -> None:

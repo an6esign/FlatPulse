@@ -70,6 +70,10 @@ check_runs_table = Table(
     Column("listings_saved", Integer, nullable=False, default=0),
     Column("new_listings", Integer, nullable=False, default=0),
     Column("notifications_sent", Integer, nullable=False, default=0),
+    Column("active_searches", Integer, nullable=False, default=0),
+    Column("unique_search_groups", Integer, nullable=False, default=0),
+    Column("cian_fetches", Integer, nullable=False, default=0),
+    Column("shared_group_hits", Integer, nullable=False, default=0),
     Column("error", Text),
 )
 Index("idx_check_runs_started_at", check_runs_table.c.started_at)
@@ -159,6 +163,24 @@ payments_table = Table(
 )
 Index("idx_payments_user_id", payments_table.c.user_id)
 Index("idx_payments_provider_payment_id", payments_table.c.provider_payment_id)
+
+analytics_events_table = Table(
+    "analytics_events",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("event_name", Text, nullable=False),
+    Column("user_id", Integer, ForeignKey("users.id")),
+    Column("search_id", Integer, ForeignKey("searches.id")),
+    Column("metadata_json", Text, nullable=False, default="{}"),
+    Column("created_at", String(40), nullable=False),
+)
+Index(
+    "idx_analytics_events_event_created",
+    analytics_events_table.c.event_name,
+    analytics_events_table.c.created_at,
+)
+Index("idx_analytics_events_user_id", analytics_events_table.c.user_id)
+Index("idx_analytics_events_search_id", analytics_events_table.c.search_id)
 
 
 class ListingStore:
@@ -301,6 +323,10 @@ class ListingStore:
         listings_saved: int = 0,
         new_listings: int = 0,
         notifications_sent: int = 0,
+        active_searches: int = 0,
+        unique_search_groups: int = 0,
+        cian_fetches: int = 0,
+        shared_group_hits: int = 0,
         error: str | None = None,
     ) -> None:
         with self.engine.begin() as conn:
@@ -314,6 +340,10 @@ class ListingStore:
                     listings_saved=listings_saved,
                     new_listings=new_listings,
                     notifications_sent=notifications_sent,
+                    active_searches=active_searches,
+                    unique_search_groups=unique_search_groups,
+                    cian_fetches=cian_fetches,
+                    shared_group_hits=shared_group_hits,
                     error=error,
                 )
             )
@@ -354,8 +384,26 @@ class ListingStore:
             row = conn.execute(
                 select(
                     func.count().label("runs"),
+                    func.coalesce(func.sum(check_runs_table.c.listings_found), 0).label(
+                        "listings_found"
+                    ),
+                    func.coalesce(func.sum(check_runs_table.c.new_listings), 0).label(
+                        "new_listings"
+                    ),
                     func.coalesce(func.sum(check_runs_table.c.notifications_sent), 0).label(
                         "notifications_sent"
+                    ),
+                    func.coalesce(func.sum(check_runs_table.c.active_searches), 0).label(
+                        "active_searches"
+                    ),
+                    func.coalesce(func.sum(check_runs_table.c.unique_search_groups), 0).label(
+                        "unique_search_groups"
+                    ),
+                    func.coalesce(func.sum(check_runs_table.c.cian_fetches), 0).label(
+                        "cian_fetches"
+                    ),
+                    func.coalesce(func.sum(check_runs_table.c.shared_group_hits), 0).label(
+                        "shared_group_hits"
                     ),
                     func.coalesce(
                         func.sum(
@@ -380,17 +428,62 @@ class ListingStore:
         if row is None:
             return {
                 "runs": 0,
+                "listings_found": 0,
+                "new_listings": 0,
                 "notifications_sent": 0,
+                "active_searches": 0,
+                "unique_search_groups": 0,
+                "cian_fetches": 0,
+                "shared_group_hits": 0,
                 "failed_runs": 0,
                 "partial_runs": 0,
             }
         data = row._mapping
         return {
             "runs": int(data["runs"] or 0),
+            "listings_found": int(data["listings_found"] or 0),
+            "new_listings": int(data["new_listings"] or 0),
             "notifications_sent": int(data["notifications_sent"] or 0),
+            "active_searches": int(data["active_searches"] or 0),
+            "unique_search_groups": int(data["unique_search_groups"] or 0),
+            "cian_fetches": int(data["cian_fetches"] or 0),
+            "shared_group_hits": int(data["shared_group_hits"] or 0),
             "failed_runs": int(data["failed_runs"] or 0),
             "partial_runs": int(data["partial_runs"] or 0),
         }
+
+    def record_event(
+        self,
+        event_name: str,
+        *,
+        user_id: int | None = None,
+        search_id: int | None = None,
+        metadata: dict[str, object] | None = None,
+    ) -> int:
+        payload = json.dumps(metadata or {}, ensure_ascii=False, sort_keys=True)
+        with self.engine.begin() as conn:
+            result = conn.execute(
+                insert(analytics_events_table).values(
+                    event_name=event_name,
+                    user_id=user_id,
+                    search_id=search_id,
+                    metadata_json=payload,
+                    created_at=utc_now(),
+                )
+            )
+            return int(result.inserted_primary_key[0])
+
+    def analytics_events_summary_since(self, since: str) -> dict[str, int]:
+        with self.engine.begin() as conn:
+            rows = conn.execute(
+                select(
+                    analytics_events_table.c.event_name,
+                    func.count().label("count"),
+                )
+                .where(analytics_events_table.c.created_at >= since)
+                .group_by(analytics_events_table.c.event_name)
+            ).fetchall()
+        return {str(row._mapping["event_name"]): int(row._mapping["count"] or 0) for row in rows}
 
     def upsert_user(
         self,
@@ -480,6 +573,17 @@ class ListingStore:
             return True
         paid_until = _parse_datetime(user.get("paid_until"))
         return paid_until is not None and paid_until > now
+
+    def user_has_used_trial(self, user_id: int) -> bool:
+        user = self.get_user(user_id)
+        return bool(user and user.get("trial_started_at"))
+
+    def user_has_active_trial(self, user_id: int) -> bool:
+        user = self.get_user(user_id)
+        if user is None:
+            return False
+        trial_ends_at = _parse_datetime(user.get("trial_ends_at"))
+        return trial_ends_at is not None and trial_ends_at > datetime.now(UTC)
 
     def user_has_active_paid_access(self, user_id: int) -> bool:
         user = self.get_user(user_id)

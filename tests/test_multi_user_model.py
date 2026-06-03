@@ -114,6 +114,8 @@ def test_trial_and_paid_access_flow(tmp_path: Path) -> None:
     assert user is not None
     assert user["trial_started_at"] is not None
     assert user["trial_ends_at"] is not None
+    assert store.user_has_used_trial(user_id) is True
+    assert store.user_has_active_trial(user_id) is True
     assert store.user_has_active_access(user_id) is True
 
     same_trial = store.start_trial_if_needed(user_id, days=7)
@@ -128,11 +130,53 @@ def test_trial_and_paid_access_flow(tmp_path: Path) -> None:
             .values(trial_ends_at=expired_at, subscription_status="expired")
         )
     assert store.user_has_active_access(user_id) is False
+    assert store.user_has_used_trial(user_id) is True
+    assert store.user_has_active_trial(user_id) is False
 
     paid_until = store.grant_paid_access(user_id, days=31)
     assert paid_until is not None
     assert store.user_has_active_access(user_id) is True
     assert store.user_has_active_paid_access(user_id) is True
+
+
+def test_paid_access_extends_from_current_paid_until(tmp_path: Path) -> None:
+    store = ListingStore(tmp_path / "test.sqlite3")
+    store.init()
+    user_id = store.upsert_user(telegram_chat_id="100")
+
+    first_paid_until = store.grant_paid_access(user_id, days=31)
+    second_paid_until = store.grant_paid_access(user_id, days=31)
+
+    assert first_paid_until is not None
+    assert second_paid_until is not None
+    first_date = datetime.fromisoformat(first_paid_until)
+    second_date = datetime.fromisoformat(second_paid_until)
+    assert second_date - first_date == timedelta(days=31)
+
+
+def test_trial_usage_survives_search_reset(tmp_path: Path) -> None:
+    store = ListingStore(tmp_path / "test.sqlite3")
+    store.init()
+    user_id = store.upsert_user(telegram_chat_id="100")
+    search_id = store.create_search(
+        user_id=user_id,
+        title="Основной поиск",
+        city="Москва",
+        region_id="1",
+        rooms=("all",),
+        min_price=None,
+        max_price=None,
+        rent_type="all",
+        sort_by="creation_date_from_newer_to_older",
+    )
+
+    store.start_trial_if_needed(user_id, days=7)
+    store.update_search(search_id, is_active=False, initialized_at=None)
+    store.clear_seen_for_search(search_id)
+
+    same_user_id = store.upsert_user(telegram_chat_id="100")
+    assert same_user_id == user_id
+    assert store.user_has_used_trial(user_id) is True
 
 
 def test_current_search_for_user_uses_latest_and_can_deactivate_older(

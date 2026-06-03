@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+import hashlib
 from dataclasses import dataclass
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
@@ -12,6 +13,7 @@ import requests
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import TelegramError
 
+from .analytics import EV_TRIAL_EXPIRED, event_for_error_type
 from .cian_url import build_cian_search_url
 from .config import ConfigError, Settings
 from .db import ListingStore
@@ -160,6 +162,11 @@ def build_search_url(settings: Settings) -> str:
     return settings.cian_search_url
 
 
+def search_fingerprint(settings: Settings) -> str:
+    url = build_search_url(settings)
+    return hashlib.sha256(url.encode("utf-8")).hexdigest()
+
+
 def settings_with_search(settings: Settings, search: Mapping[str, object]) -> Settings:
     return replace(
         settings,
@@ -232,6 +239,10 @@ def _run_check(
     listings_saved = 0
     new_listings = 0
     notifications_sent = 0
+    active_searches_count = 0
+    unique_search_groups = 0
+    cian_fetches = 0
+    shared_group_hits = 0
     search_errors: list[str] = []
 
     try:
@@ -240,6 +251,7 @@ def _run_check(
             only_chat_id=only_chat_id,
             only_search_id=only_search_id,
         )
+        active_searches_count = len(searches)
         if not searches:
             if store.searches_count() > 0:
                 logger.info("No active searches to check")
@@ -284,78 +296,23 @@ def _run_check(
         if not settings.dry_run and not settings.telegram_bot_token:
             raise ConfigError("TELEGRAM_BOT_TOKEN is required unless DRY_RUN=true")
 
-        for index, search in enumerate(searches):
-            search_id = int(search["id"])
-            chat_id = str(search["telegram_chat_id"])
+        search_groups: dict[str, list[tuple[dict[str, object], Settings]]] = {}
+        for search in searches:
             try:
                 search_settings = settings_with_search(settings, search)
-                was_initialized = bool(search.get("initialized_at"))
-
-                listings = fetch_listings(search_settings)
-                listings_found += len(listings)
-                listings_saved += store.upsert_many(listings)
-                store.record_search_success(search_id, initialize=not was_initialized)
-                logger.info(
-                    "Fetched %s listings for search_id=%s chat_id=%s",
-                    len(listings),
-                    search_id,
-                    chat_id,
-                )
-
-                if not was_initialized:
-                    store.mark_many_search_listings_seen(
-                        search_id=search_id,
-                        cian_ids=[listing.cian_id for listing in listings],
-                        sent=False,
-                    )
-                    _remember_search_activity_checkpoint(store, search)
-                    logger.info(
-                        "Seeded %s existing listings for search_id=%s", len(listings), search_id
-                    )
-                    continue
-
-                unseen = store.unseen_listings_for_search(search_id, listings)
-                new_listings += len(unseen)
-                if not unseen:
-                    _maybe_notify_no_new_listings(store, search_settings, search)
-                    continue
-
-                if not search_settings.dry_run and not store.user_has_active_access(
-                    int(search["user_id"])
-                ):
-                    _maybe_notify_payment_required(store, search_settings, search)
-                    continue
-
-                if search_settings.dry_run:
-                    for listing in unseen:
-                        logger.info(
-                            "DRY_RUN search_id=%s listing:\n%s",
-                            search_id,
-                            listing.format_message(),
-                        )
-                    store.mark_many_search_listings_seen(
-                        search_id=search_id,
-                        cian_ids=[listing.cian_id for listing in unseen],
-                        sent=False,
-                    )
-                    _remember_search_activity_checkpoint(store, search)
-                    continue
-
-                notifier = TelegramNotifier(
-                    token=search_settings.telegram_bot_token or "",
-                    chat_id=chat_id,
-                )
-                sent_ids = send_listings_sync(notifier, unseen)
-                notifications_sent += len(sent_ids)
-                store.mark_many_search_listings_seen(
-                    search_id=search_id,
-                    cian_ids=sent_ids,
-                    sent=True,
-                )
-                if sent_ids:
-                    _remember_search_activity_checkpoint(store, search)
+                fingerprint = search_fingerprint(search_settings)
+                search_groups.setdefault(fingerprint, []).append((search, search_settings))
             except Exception as exc:
+                search_id = int(search["id"])
+                user_id = int(search["user_id"])
+                chat_id = str(search["telegram_chat_id"])
                 error_type = classify_check_error(exc)
+                _record_check_error_event(
+                    store,
+                    error_type,
+                    user_id=user_id,
+                    search_id=search_id,
+                )
                 store.record_search_error(
                     search_id,
                     error_type=error_type,
@@ -363,14 +320,145 @@ def _run_check(
                 )
                 error = f"{error_type}: search_id={search_id} chat_id={chat_id}: {exc}"
                 search_errors.append(error)
-                logger.exception("Search check failed: %s", error)
-            finally:
+                logger.exception("Search check failed before grouping: %s", error)
+
+        unique_search_groups = len(search_groups)
+        shared_group_hits = sum(max(len(group) - 1, 0) for group in search_groups.values())
+
+        for index, group in enumerate(search_groups.values()):
+            group_settings = group[0][1]
+            try:
+                cian_fetches += 1
+                listings = fetch_listings(group_settings)
+                listings_saved += store.upsert_many(listings)
+                logger.info(
+                    "Fetched %s listings for search_group size=%s fingerprint=%s city=%s",
+                    len(listings),
+                    len(group),
+                    search_fingerprint(group_settings)[:12],
+                    group_settings.cian_city,
+                )
+            except Exception as exc:
+                error_type = classify_check_error(exc)
+                for search, _search_settings in group:
+                    search_id = int(search["id"])
+                    user_id = int(search["user_id"])
+                    chat_id = str(search["telegram_chat_id"])
+                    _record_check_error_event(
+                        store,
+                        error_type,
+                        user_id=user_id,
+                        search_id=search_id,
+                    )
+                    store.record_search_error(
+                        search_id,
+                        error_type=error_type,
+                        cooldown_until=_cooldown_until_for_error(settings, error_type),
+                    )
+                    error = f"{error_type}: search_id={search_id} chat_id={chat_id}: {exc}"
+                    search_errors.append(error)
+                    logger.exception("Search group check failed: %s", error)
                 _delay_between_searches(
                     settings,
                     current_index=index,
-                    total_count=len(searches),
+                    total_count=len(search_groups),
                     only_chat_id=only_chat_id,
                 )
+                continue
+
+            for search, search_settings in group:
+                search_id = int(search["id"])
+                chat_id = str(search["telegram_chat_id"])
+                try:
+                    was_initialized = bool(search.get("initialized_at"))
+
+                    listings_found += len(listings)
+                    store.record_search_success(search_id, initialize=not was_initialized)
+                    _maybe_record_trial_expired(store, search)
+                    logger.info(
+                        "Applied %s listings for search_id=%s chat_id=%s",
+                        len(listings),
+                        search_id,
+                        chat_id,
+                    )
+
+                    if not was_initialized:
+                        store.mark_many_search_listings_seen(
+                            search_id=search_id,
+                            cian_ids=[listing.cian_id for listing in listings],
+                            sent=False,
+                        )
+                        _remember_search_activity_checkpoint(store, search)
+                        logger.info(
+                            "Seeded %s existing listings for search_id=%s",
+                            len(listings),
+                            search_id,
+                        )
+                        continue
+
+                    unseen = store.unseen_listings_for_search(search_id, listings)
+                    new_listings += len(unseen)
+                    if not unseen:
+                        _maybe_notify_no_new_listings(store, search_settings, search)
+                        continue
+
+                    if not search_settings.dry_run and not store.user_has_active_access(
+                        int(search["user_id"])
+                    ):
+                        _maybe_notify_payment_required(store, search_settings, search)
+                        continue
+
+                    if search_settings.dry_run:
+                        for listing in unseen:
+                            logger.info(
+                                "DRY_RUN search_id=%s listing:\n%s",
+                                search_id,
+                                listing.format_message(),
+                            )
+                        store.mark_many_search_listings_seen(
+                            search_id=search_id,
+                            cian_ids=[listing.cian_id for listing in unseen],
+                            sent=False,
+                        )
+                        _remember_search_activity_checkpoint(store, search)
+                        continue
+
+                    notifier = TelegramNotifier(
+                        token=search_settings.telegram_bot_token or "",
+                        chat_id=chat_id,
+                    )
+                    sent_ids = send_listings_sync(notifier, unseen)
+                    notifications_sent += len(sent_ids)
+                    store.mark_many_search_listings_seen(
+                        search_id=search_id,
+                        cian_ids=sent_ids,
+                        sent=True,
+                    )
+                    if sent_ids:
+                        _remember_search_activity_checkpoint(store, search)
+                except Exception as exc:
+                    error_type = classify_check_error(exc)
+                    _record_check_error_event(
+                        store,
+                        error_type,
+                        user_id=int(search["user_id"]),
+                        search_id=search_id,
+                    )
+                    store.record_search_error(
+                        search_id,
+                        error_type=error_type,
+                        cooldown_until=_cooldown_until_for_error(settings, error_type),
+                    )
+                    error = f"{error_type}: search_id={search_id} chat_id={chat_id}: {exc}"
+                    search_errors.append(error)
+                    logger.exception("Search check failed: %s", error)
+
+            _delay_between_searches(
+                settings,
+                current_index=index,
+                total_count=len(search_groups),
+                only_chat_id=only_chat_id,
+            )
 
         status = "partial" if search_errors else "success"
         error_text = "\n".join(search_errors) if search_errors else None
@@ -381,6 +469,10 @@ def _run_check(
             listings_saved=listings_saved,
             new_listings=new_listings,
             notifications_sent=notifications_sent,
+            active_searches=active_searches_count,
+            unique_search_groups=unique_search_groups,
+            cian_fetches=cian_fetches,
+            shared_group_hits=shared_group_hits,
             error=error_text,
         )
         if error_text is not None and _should_notify_admins_about_check_problem(
@@ -395,6 +487,7 @@ def _run_check(
             )
         return CheckRunResult(run_id=run_id, notifications_sent=notifications_sent)
     except Exception as exc:
+        _record_check_error_event(store, classify_check_error(exc))
         store.finish_check_run(
             run_id,
             status="failed",
@@ -402,6 +495,10 @@ def _run_check(
             listings_saved=listings_saved,
             new_listings=new_listings,
             notifications_sent=notifications_sent,
+            active_searches=active_searches_count,
+            unique_search_groups=unique_search_groups,
+            cian_fetches=cian_fetches,
+            shared_group_hits=shared_group_hits,
             error=f"{classify_check_error(exc)}: {exc}",
         )
         _notify_admins_about_check_problem(
@@ -511,6 +608,23 @@ def classify_check_error(exc: Exception) -> str:
     if "telegram" in message or "bot" in message or "chat not found" in message:
         return "telegram"
     return "unknown"
+
+
+def _record_check_error_event(
+    store: ListingStore,
+    error_type: str,
+    *,
+    user_id: int | None = None,
+    search_id: int | None = None,
+) -> None:
+    try:
+        store.record_event(
+            event_for_error_type(error_type),
+            user_id=user_id,
+            search_id=search_id,
+        )
+    except Exception:
+        logger.exception("Failed to record check error event type=%s", error_type)
 
 
 def _cooldown_until_for_error(settings: Settings, error_type: str) -> str | None:
@@ -679,8 +793,24 @@ def _maybe_notify_payment_required(
             _payment_required_notice_state_key(search_id),
             now.isoformat(timespec="seconds"),
         )
+        _maybe_record_trial_expired(store, search)
     except Exception:
         logger.exception("Failed to send payment-required notice for search_id=%s", search_id)
+
+
+def _maybe_record_trial_expired(store: ListingStore, search: Mapping[str, object]) -> None:
+    user_id = int(search["user_id"])
+    search_id = int(search["id"])
+    user = store.get_user(user_id)
+    if user is None or not user.get("trial_started_at"):
+        return
+    if store.user_has_active_access(user_id):
+        return
+    state_key = _trial_expired_event_state_key(search_id)
+    if store.get_user_state(user_id, state_key):
+        return
+    store.record_event(EV_TRIAL_EXPIRED, user_id=user_id, search_id=search_id)
+    store.set_user_state(user_id, state_key, datetime.now(UTC).isoformat(timespec="seconds"))
 
 
 def _last_new_listing_state_key(search_id: int) -> str:
@@ -693,6 +823,10 @@ def _no_new_nudge_state_key(search_id: int) -> str:
 
 def _payment_required_notice_state_key(search_id: int) -> str:
     return f"payment_required_notice_at:{search_id}"
+
+
+def _trial_expired_event_state_key(search_id: int) -> str:
+    return f"trial_expired_event_recorded:{search_id}"
 
 
 def _parse_state_datetime(value: str | None) -> datetime | None:
@@ -728,16 +862,21 @@ def _no_new_listings_nudge_keyboard() -> InlineKeyboardMarkup:
 def _payment_required_text(settings: Settings) -> str:
     return "\n".join(
         [
-            "Пробный период закончился.",
+            "⏳ Пробный период закончился.",
             "",
-            f"Чтобы продолжить получать новые квартиры, оформите подписку за {settings.subscription_price_rub} ₽ в месяц.",
+            "FlatPulse уже знает ваши параметры поиска, но новые уведомления сейчас на паузе.",
+            "",
+            f"Подписка стоит {settings.subscription_price_rub} ₽ в месяц.",
+            "После оплаты бот продолжит присылать только новые подходящие квартиры.",
+            "",
+            "Без автосписаний: следующий месяц оплачивается вручную.",
         ]
     )
 
 
 def _payment_required_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("Оформить подписку", callback_data="cfg:subscribe")]]
+        [[InlineKeyboardButton("💳 Подписка", callback_data="cfg:subscribe")]]
     )
 
 

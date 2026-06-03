@@ -3,11 +3,13 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import requests
+from sqlalchemy import update
 from telegram.error import TelegramError
 
 from cian_rent_alerts import service
+from cian_rent_alerts.analytics import EV_CAPTCHA_ERROR, EV_TRIAL_EXPIRED
 from cian_rent_alerts.config import ConfigError, Settings
-from cian_rent_alerts.db import ListingStore
+from cian_rent_alerts.db import ListingStore, users_table
 from cian_rent_alerts.models import Listing
 from cian_rent_alerts.scraper import CaptchaError, EmptyParseError, NetworkFetchError
 
@@ -111,6 +113,65 @@ def test_empty_first_check_initializes_search_without_cooldown(
     assert second_run["new_listings"] == 1
 
 
+def test_identical_searches_share_single_cian_fetch(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    settings = replace(
+        Settings.from_env(env_file=None),
+        database_path=tmp_path / "test.sqlite3",
+        dry_run=True,
+        listing_limit=10,
+    )
+    store = ListingStore(settings.database_path)
+    store.init()
+    first_user_id = store.upsert_user(telegram_chat_id="100")
+    second_user_id = store.upsert_user(telegram_chat_id="200")
+    first_search_id = store.create_search(
+        user_id=first_user_id,
+        title="Основной поиск",
+        city="Москва",
+        region_id="1",
+        rooms=("all",),
+        min_price=None,
+        max_price=60000,
+        rent_type="long",
+        sort_by="creation_date_from_newer_to_older",
+    )
+    second_search_id = store.create_search(
+        user_id=second_user_id,
+        title="Основной поиск",
+        city="Москва",
+        region_id="1",
+        rooms=("all",),
+        min_price=None,
+        max_price=60000,
+        rent_type="long",
+        sort_by="creation_date_from_newer_to_older",
+    )
+    scrape_calls = 0
+
+    def fake_scrape(_scraper, _limit):
+        nonlocal scrape_calls
+        scrape_calls += 1
+        return [_listing("1")]
+
+    monkeypatch.setattr(service, "build_scraper", lambda _settings: object())
+    monkeypatch.setattr(service, "scrape", fake_scrape)
+
+    assert service.run_check(settings) == 0
+    last_run = store.last_check_run()
+
+    assert scrape_calls == 1
+    assert store.search_seen_count(first_search_id) == 1
+    assert store.search_seen_count(second_search_id) == 1
+    assert last_run is not None
+    assert last_run["active_searches"] == 2
+    assert last_run["unique_search_groups"] == 1
+    assert last_run["cian_fetches"] == 1
+    assert last_run["shared_group_hits"] == 1
+
+
 def test_check_for_chat_without_active_search_does_not_scrape(
     tmp_path: Path,
     monkeypatch,
@@ -156,12 +217,15 @@ def test_check_waits_between_multiple_searches(tmp_path: Path, monkeypatch) -> N
     store.init()
     first_user_id = store.upsert_user(telegram_chat_id="100")
     second_user_id = store.upsert_user(telegram_chat_id="200")
-    for user_id in (first_user_id, second_user_id):
+    for user_id, city, region_id in (
+        (first_user_id, "Москва", "1"),
+        (second_user_id, "Казань", "4777"),
+    ):
         store.create_search(
             user_id=user_id,
             title="Основной поиск",
-            city="Москва",
-            region_id="1",
+            city=city,
+            region_id=region_id,
             rooms=("all",),
             min_price=None,
             max_price=None,
@@ -599,6 +663,7 @@ def test_failed_search_gets_cooldown_and_is_skipped_next_run(
     assert search["cooldown_until"] is not None
     assert store.cooldown_searches_count() == 1
     assert store.active_searches() == []
+    assert store.analytics_events_summary_since("2000-01-01T00:00:00+00:00")[EV_CAPTCHA_ERROR] == 1
 
     monkeypatch.setattr(
         service,
@@ -608,6 +673,45 @@ def test_failed_search_gets_cooldown_and_is_skipped_next_run(
 
     assert service.run_check(settings) == 0
     assert store.search_seen_count(search_id) == 0
+
+
+def test_expired_trial_event_is_recorded_once(tmp_path: Path, monkeypatch) -> None:
+    settings = replace(
+        Settings.from_env(env_file=None),
+        database_path=tmp_path / "test.sqlite3",
+        dry_run=True,
+    )
+    store = ListingStore(settings.database_path)
+    store.init()
+    user_id = store.upsert_user(telegram_chat_id="100")
+    search_id = store.create_search(
+        user_id=user_id,
+        title="Основной поиск",
+        city="Москва",
+        region_id="1",
+        rooms=("all",),
+        min_price=None,
+        max_price=None,
+        rent_type="all",
+        sort_by="creation_date_from_newer_to_older",
+    )
+    store.start_trial_if_needed(user_id, days=7)
+    with store.engine.begin() as conn:
+        conn.execute(
+            update(users_table)
+            .where(users_table.c.id == user_id)
+            .values(trial_ends_at="2026-01-01T00:00:00+00:00")
+        )
+
+    monkeypatch.setattr(service, "build_scraper", lambda _settings: object())
+    monkeypatch.setattr(service, "scrape", lambda _scraper, _limit: [_listing("1")])
+
+    assert service.run_check(settings) == 0
+    assert service.run_check(settings) == 0
+
+    summary = store.analytics_events_summary_since("2000-01-01T00:00:00+00:00")
+    assert summary[EV_TRIAL_EXPIRED] == 1
+    assert store.search_seen_count(search_id) == 1
 
 
 def test_successful_search_clears_previous_cooldown(tmp_path: Path, monkeypatch) -> None:

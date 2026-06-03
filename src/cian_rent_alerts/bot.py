@@ -25,6 +25,29 @@ from telegram.ext import (
     filters,
 )
 
+from .analytics import (
+    EV_CITY_SELECTED,
+    EV_CAPTCHA_ERROR,
+    EV_EMPTY_PARSE_ERROR,
+    EV_FILTERS_COMPLETED,
+    EV_INITIAL_SEARCH_SUCCESS,
+    EV_MANUAL_CHECK,
+    EV_NOTIFICATIONS_STOPPED,
+    EV_PAYMENT_CREATED,
+    EV_PAYMENT_OPENED,
+    EV_PAYMENT_SUCCEEDED,
+    EV_SEARCH_DELETED,
+    EV_SETUP_STARTED,
+    EV_SHOW_FOUND_CLICKED,
+    EV_SHOW_LATER_CLICKED,
+    EV_START,
+    EV_TELEGRAM_SEND_ERROR,
+    EV_TRIAL_OFFER_CLICKED,
+    EV_TRIAL_EXPIRED,
+    EV_TRIAL_STARTED,
+    EV_PARSER_ERROR,
+    FUNNEL_EVENTS,
+)
 from .cian_locations import find_cian_location
 from .cian_url import extract_polygon
 from .billing import YooKassaClient, billing_is_configured
@@ -37,8 +60,9 @@ from .service import CheckAlreadyRunning, build_search_url, run_check_result, se
 logger = logging.getLogger(__name__)
 
 Handler = Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[None]]
-SHOW_FOUND_LIMIT = 20
+SHOW_FOUND_LIMIT = 10
 MANUAL_CHECK_COOLDOWN_SECONDS = 60
+START_DEDUP_WINDOW_SECONDS = 3
 
 
 CITY_OPTIONS = {
@@ -121,6 +145,9 @@ class SettingsBot:
         application.add_handler(CommandHandler("admin_health", self._admin_only(self.admin_health)))
         application.add_handler(CommandHandler("admin_report", self._admin_only(self.admin_report)))
         application.add_handler(
+            CommandHandler("admin_metrics", self._admin_only(self.admin_metrics))
+        )
+        application.add_handler(
             CommandHandler("dev_payment_screen", self._admin_only(self.dev_payment_screen))
         )
         application.add_handler(
@@ -162,6 +189,26 @@ class SettingsBot:
             return None
         return self.store.search_seen_count(int(search["id"]))
 
+    def access_status_for_update(self, update: Update) -> str:
+        search = self._current_search(update)
+        if search is None:
+            return "💳 Подписка не активна"
+        if not search["is_active"]:
+            return "⏸ Уведомления остановлены"
+
+        user = self.store.get_user(int(search["user_id"]))
+        if user is None:
+            return "💳 Подписка не активна"
+        if user.get("is_admin"):
+            return "👑 Админ-доступ активен"
+        if self.store.user_has_active_paid_access(int(user["id"])):
+            return f"💎 Подписка активна до {_format_timestamp(user.get('paid_until'))}"
+        if self.store.user_has_active_trial(int(user["id"])):
+            return f"🎁 Пробный период активен до {_format_timestamp(user.get('trial_ends_at'))}"
+        if self.store.user_has_used_trial(int(user["id"])):
+            return "⏳ Пробный период закончился"
+        return "💳 Подписка не активна"
+
     def _authorized(self, handler: Handler) -> Handler:
         async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             actual_chat_id = update.effective_chat.id if update.effective_chat else None
@@ -182,21 +229,64 @@ class SettingsBot:
 
         return wrapped
 
+    def _record_event(
+        self,
+        event_name: str,
+        update: Update,
+        *,
+        metadata: dict[str, object] | None = None,
+    ) -> None:
+        try:
+            search = self._current_search(update)
+            if search is not None:
+                self.store.record_event(
+                    event_name,
+                    user_id=int(search["user_id"]),
+                    search_id=int(search["id"]),
+                    metadata=metadata,
+                )
+                return
+
+            user = self._current_user(update)
+            self.store.record_event(
+                event_name,
+                user_id=int(user["id"]) if user is not None else None,
+                metadata=metadata,
+            )
+        except Exception:
+            logger.exception("Failed to record analytics event=%s", event_name)
+
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         chat = update.effective_chat
         if chat is None:
             return
 
         is_new_user = self.store.get_user_by_chat_id(str(chat.id)) is None
-        self._ensure_user_search(update)
+        search = self._ensure_user_search(update)
+        if search is None:
+            return
+        if self._is_duplicate_start(int(search["user_id"])):
+            logger.info("Ignored duplicate /start for chat_id=%s", chat.id)
+            return
+        self._record_event(EV_START, update)
         if is_new_user:
             await _respond(update, _first_entry_text(), _start_reply_keyboard())
             return
         await _respond(update, _welcome_text(), _main_keyboard())
 
+    def _is_duplicate_start(self, user_id: int) -> bool:
+        now = datetime.now(UTC)
+        last_start_at = self.store.get_user_state(user_id, "last_start_at")
+        self.store.set_user_state(user_id, "last_start_at", now.isoformat(timespec="seconds"))
+        last_start = _parse_state_datetime(last_start_at)
+        if last_start is None:
+            return False
+        return (now - last_start).total_seconds() < START_DEDUP_WINDOW_SECONDS
+
     async def begin_onboarding(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         self._ensure_user_search(update)
         self._clear_awaiting(update)
+        self._record_event(EV_SETUP_STARTED, update)
         if update.effective_message is not None:
             await update.effective_message.reply_text(
                 "Начнем с настройки поиска.",
@@ -218,6 +308,12 @@ class SettingsBot:
     async def menu_from_reply(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         self._ensure_user_search(update)
         self._clear_awaiting(update)
+        if update.effective_message is not None:
+            await update.effective_message.reply_text(
+                "Открываю меню.",
+                reply_markup=ReplyKeyboardRemove(),
+                disable_web_page_preview=True,
+            )
         await _respond(update, _welcome_text(), _main_keyboard())
 
     async def on_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -261,6 +357,7 @@ class SettingsBot:
             await _reply(update, str(exc))
             return
         self._update_current_search(update, city=city, region_id=region_id, use_generated_url=True)
+        self._record_event(EV_CITY_SELECTED, update, metadata={"source": "manual"})
         self._clear_awaiting(update)
         await _respond(update, _rooms_prompt(), _onboarding_rooms_keyboard())
 
@@ -407,7 +504,12 @@ class SettingsBot:
         if search is None:
             raise ConfigError("Не удалось найти поиск пользователя")
         search_id = int(search["id"])
-        self.store.update_search(search_id, **values, is_active=True, initialized_at=None)
+        self.store.update_search(
+            search_id,
+            **values,
+            is_active=self.store.user_has_active_access(int(search["user_id"])),
+            initialized_at=None,
+        )
         self.store.deactivate_other_searches_for_user(int(search["user_id"]), search_id)
         self.store.clear_seen_for_search(search_id)
 
@@ -434,6 +536,7 @@ class SettingsBot:
 
     async def setup_command(self, update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
         self._clear_awaiting(update)
+        self._record_event(EV_SETUP_STARTED, update)
         await _respond(update, _city_prompt(), _onboarding_city_keyboard())
 
     async def settings_command(self, update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -443,6 +546,7 @@ class SettingsBot:
                 self.effective_settings_for_update(update),
                 status=self.search_status_for_update(update),
                 found_count=self.search_found_count_for_update(update),
+                access_status=self.access_status_for_update(update),
             ),
             _search_settings_keyboard(),
         )
@@ -470,6 +574,7 @@ class SettingsBot:
             region_id=region_id,
             use_generated_url=True,
         )
+        self._record_event(EV_CITY_SELECTED, update, metadata={"source": "command"})
         await self._confirm_settings(update, "Город обновлен.")
 
     async def set_region(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -646,6 +751,7 @@ class SettingsBot:
             "last_manual_check_at",
             datetime.now(UTC).isoformat(timespec="seconds"),
         )
+        self._record_event(EV_MANUAL_CHECK, update)
         progress_message = await _reply(update, "🔎 Ищу квартиры...")
         try:
             result = await asyncio.to_thread(
@@ -702,6 +808,9 @@ class SettingsBot:
     async def admin_report(self, update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
         await _reply(update, _format_admin_report(self.store, self.effective_settings()))
 
+    async def admin_metrics(self, update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+        await _reply(update, _format_admin_metrics(self.store))
+
     async def dev_payment_screen(self, update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
         if self.settings.environment != "dev":
             return
@@ -729,6 +838,7 @@ class SettingsBot:
             return
         if action == "cfg:setup":
             self._clear_awaiting(update)
+            self._record_event(EV_SETUP_STARTED, update)
             await _respond(update, _city_prompt(), _onboarding_city_keyboard())
             return
         if action == "onb:step:rooms":
@@ -750,6 +860,7 @@ class SettingsBot:
                     self.effective_settings_for_update(update),
                     status=self.search_status_for_update(update),
                     found_count=self.search_found_count_for_update(update),
+                    access_status=self.access_status_for_update(update),
                 ),
                 _search_settings_keyboard(),
             )
@@ -862,13 +973,29 @@ class SettingsBot:
             await self._run_current_check(update, context)
             return
         if action == "cfg:subscribe":
+            self._record_event(EV_PAYMENT_OPENED, update)
             await self._create_subscription_payment(update)
             return
         if action == "cfg:check_payment":
             await self._check_subscription_payment(update)
             return
         if action == "cfg:show_found":
+            self._record_event(EV_SHOW_FOUND_CLICKED, update)
             await self._show_found_listings(update, context)
+            return
+        if action == "cfg:show_later":
+            self._record_event(EV_SHOW_LATER_CLICKED, update)
+            await self._show_found_later(update, context)
+            return
+        if action == "cfg:archive":
+            await self._show_archive_listings(update)
+            return
+        if action == "cfg:start_trial":
+            self._record_event(EV_TRIAL_OFFER_CLICKED, update)
+            await self._start_trial(update)
+            return
+        if action == "cfg:decline_trial":
+            await self._decline_trial(update)
             return
         if action == "cfg:stop":
             await self._stop_current_search(update)
@@ -888,6 +1015,7 @@ class SettingsBot:
                 region_id=region_id,
                 use_generated_url=True,
             )
+            self._record_event(EV_CITY_SELECTED, update, metadata={"source": "button"})
             await _respond(update, _rooms_prompt(), _onboarding_rooms_keyboard())
             return
         if action == "onb:city_manual":
@@ -994,6 +1122,7 @@ class SettingsBot:
                 region_id=region_id,
                 use_generated_url=True,
             )
+            self._record_event(EV_CITY_SELECTED, update, metadata={"source": "button"})
             await self._confirm_settings(update, "Город обновлен.")
             return
         if action.startswith("cfg:rooms:"):
@@ -1029,14 +1158,8 @@ class SettingsBot:
             await self._confirm_settings(update, "Сортировка обновлена.")
 
     async def _finish_onboarding(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        completed = await self._run_initial_search_after_setup(update, context)
-        if completed:
-            self._start_trial_for_update(update)
-        await _reply_with_markup(
-            update,
-            "Кнопка Меню теперь доступна снизу.",
-            _configure_search_reply_keyboard(),
-        )
+        self._record_event(EV_FILTERS_COMPLETED, update)
+        await self._run_initial_search_after_setup(update, context)
 
     async def _run_initial_search_after_setup(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -1047,13 +1170,16 @@ class SettingsBot:
             await _reply(update, "Не удалось запустить поиск.")
             return False
 
+        search_id = int(search["id"])
+        user_id = int(search["user_id"])
+        self.store.update_search(search_id, is_active=True)
         progress_message = await _reply(update, "🔎 Ищу квартиры...")
         try:
             result = await asyncio.to_thread(
                 run_check_result,
                 self.settings,
                 only_chat_id=str(chat.id),
-                only_search_id=int(search["id"]),
+                only_search_id=search_id,
                 fail_if_running=True,
             )
         except CheckAlreadyRunning:
@@ -1064,11 +1190,19 @@ class SettingsBot:
             await _delete_message(progress_message)
             await _reply(update, f"Ошибка проверки: {exc}")
             return False
+        finally:
+            if not self.store.user_has_active_access(user_id):
+                self.store.update_search(search_id, is_active=False)
 
         await _delete_message(progress_message)
         context.user_data["show_found_after_initial_seed"] = True
         current_run = self.store.get_check_run(result.run_id) if result.run_id else None
         found = current_run["listings_found"] if current_run else 0
+        self._record_event(
+            EV_INITIAL_SEARCH_SUCCESS,
+            update,
+            metadata={"found": int(found or 0)},
+        )
         await _respond(
             update,
             _search_configured_text(
@@ -1085,13 +1219,62 @@ class SettingsBot:
             return None
         return self.store.get_user_by_chat_id(str(chat.id))
 
-    def _start_trial_for_update(self, update: Update) -> None:
+    async def _start_trial(self, update: Update) -> None:
         search = self._ensure_user_search(update)
         if search is None:
+            await _respond(update, "Не удалось найти поиск.", _main_keyboard())
+            return
+        user_id = int(search["user_id"])
+        if self.store.user_has_active_paid_access(user_id):
+            self.store.update_search(int(search["id"]), is_active=True)
+            await _respond(
+                update,
+                "✅ Подписка уже активна.\n\nНовые квартиры будут приходить автоматически.",
+                _main_keyboard(),
+            )
+            return
+        if self.store.user_has_active_trial(user_id):
+            user = self.store.get_user(user_id)
+            self.store.update_search(int(search["id"]), is_active=True)
+            await _respond(
+                update,
+                "✅ Бесплатный период уже активен.\n\n"
+                f"Он действует до {_format_timestamp(user.get('trial_ends_at') if user else None)}. "
+                "Новые квартиры будут приходить автоматически.",
+                _main_keyboard(),
+            )
+            return
+        if self.store.user_has_used_trial(user_id):
+            self.store.update_search(int(search["id"]), is_active=False)
+            await _respond(
+                update,
+                _trial_used_text(self.settings),
+                _subscribe_keyboard(self.settings),
+            )
             return
         self.store.start_trial_if_needed(
-            int(search["user_id"]),
+            user_id,
             days=self.settings.trial_days,
+        )
+        self.store.update_search(int(search["id"]), is_active=True)
+        self._record_event(EV_TRIAL_STARTED, update)
+        await _respond(
+            update,
+            "✅ Бесплатный период запущен.\n\n"
+            f"{self.settings.trial_days} дней я буду проверять новые квартиры и присылать "
+            "только свежие варианты по вашим фильтрам.",
+            _main_keyboard(),
+        )
+
+    async def _decline_trial(self, update: Update) -> None:
+        search = self._current_search(update)
+        if search is not None:
+            self.store.update_search(int(search["id"]), is_active=False)
+        await _respond(
+            update,
+            "Ок, бесплатный период не запускаю.\n\n"
+            "Новые квартиры приходить не будут, но найденные варианты можно посмотреть в архиве.",
+            _main_keyboard(),
         )
 
     async def _create_subscription_payment(self, update: Update) -> None:
@@ -1101,12 +1284,16 @@ class SettingsBot:
             return
         user_id = int(user["id"])
         if self.store.user_has_active_paid_access(user_id):
-            await _respond(update, "Подписка уже активна.", _main_keyboard())
+            await _respond(
+                update,
+                "✅ Подписка уже активна.\n\nНовые квартиры будут приходить автоматически.",
+                _main_keyboard(),
+            )
             return
         if not billing_is_configured(self.settings):
             await _respond(
                 update,
-                "Оплата пока не настроена. Мы скоро включим подписку.",
+                "Оплата пока не подключена.\n\nМы скоро включим подписку и сообщим, когда она станет доступна.",
                 _main_keyboard(),
             )
             return
@@ -1116,8 +1303,8 @@ class SettingsBot:
             confirmation_url = str(pending["confirmation_url"])
             await _respond(
                 update,
-                _payment_created_text(confirmation_url),
-                _payment_keyboard(confirmation_url),
+                _payment_created_text(self.settings),
+                _payment_keyboard(confirmation_url, self.settings),
             )
             return
 
@@ -1140,15 +1327,20 @@ class SettingsBot:
             confirmation_url=payment.confirmation_url,
             raw_json=payment.raw_json,
         )
+        self._record_event(
+            EV_PAYMENT_CREATED,
+            update,
+            metadata={"amount_rub": self.settings.subscription_price_rub},
+        )
         if not payment.confirmation_url:
             await _respond(
-                update, "Платеж создан, но YooKassa не вернула ссылку.", _main_keyboard()
+                update, "Платеж создан, но YooKassa не вернула ссылку на оплату.", _main_keyboard()
             )
             return
         await _respond(
             update,
-            _payment_created_text(payment.confirmation_url),
-            _payment_keyboard(payment.confirmation_url),
+            _payment_created_text(self.settings),
+            _payment_keyboard(payment.confirmation_url, self.settings),
         )
 
     async def _check_subscription_payment(self, update: Update) -> None:
@@ -1159,10 +1351,14 @@ class SettingsBot:
         user_id = int(user["id"])
         pending = self.store.latest_pending_payment_for_user(user_id)
         if pending is None:
-            await _respond(update, "Активного платежа пока нет.", _subscribe_keyboard())
+            await _respond(
+                update,
+                "Активного платежа пока нет.\n\nОформите подписку, чтобы получить ссылку на оплату.",
+                _subscribe_keyboard(self.settings),
+            )
             return
         if not billing_is_configured(self.settings):
-            await _respond(update, "Оплата пока не настроена.", _main_keyboard())
+            await _respond(update, "Оплата пока не подключена.", _main_keyboard())
             return
 
         confirmation_url = str(pending.get("confirmation_url") or "")
@@ -1175,7 +1371,7 @@ class SettingsBot:
             await _respond(
                 update,
                 f"Не удалось проверить платеж: {exc}",
-                _payment_keyboard(confirmation_url),
+                _payment_keyboard(confirmation_url, self.settings),
             )
             return
 
@@ -1192,16 +1388,20 @@ class SettingsBot:
             raw_json=payment.raw_json,
         )
         if paid_until is not None:
+            self._record_event(EV_PAYMENT_SUCCEEDED, update)
             await _respond(
                 update,
-                f"Подписка активна до {_format_timestamp(paid_until)}.",
+                "✅ Оплата прошла.\n\n"
+                f"Подписка активна до {_format_timestamp(paid_until)}. "
+                "Новые квартиры будут приходить автоматически.",
                 _main_keyboard(),
             )
             return
         await _respond(
             update,
-            "Оплата пока не подтверждена. Если вы уже оплатили, попробуйте проверить еще раз через минуту.",
-            _payment_keyboard(confirmation_url),
+            "Оплата пока не подтверждена.\n\n"
+            "Если вы уже оплатили, нажмите «✅ Я оплатил» еще раз через минуту.",
+            _payment_keyboard(confirmation_url, self.settings),
         )
 
     async def _confirm_settings(self, update: Update, prefix: str) -> None:
@@ -1218,7 +1418,7 @@ class SettingsBot:
         await _respond(
             update,
             f"{prefix}\n\n"
-            f"{_format_settings(effective_settings, status=self.search_status_for_update(update), found_count=self.search_found_count_for_update(update))}",
+            f"{_format_settings(effective_settings, status=self.search_status_for_update(update), found_count=self.search_found_count_for_update(update), access_status=self.access_status_for_update(update))}",
             _search_settings_keyboard(),
         )
 
@@ -1233,10 +1433,35 @@ class SettingsBot:
     async def _show_found_listings(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
+        shown = await self._send_seen_listings(update)
+        if shown and context.user_data.pop("show_found_after_initial_seed", False):
+            await _reply_with_markup(
+                update,
+                _trial_offer_text(self.settings),
+                _trial_offer_keyboard(self.settings),
+            )
+
+    async def _show_found_later(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        context.user_data.pop("show_found_after_initial_seed", None)
+        await _respond(
+            update, _trial_offer_text(self.settings), _trial_offer_keyboard(self.settings)
+        )
+
+    async def _show_archive_listings(self, update: Update) -> None:
         search = self._current_search(update)
         if search is None:
             await _reply(update, "Не удалось найти поиск.")
             return
+        if self.store.search_seen_count(int(search["id"])) == 0:
+            await _respond(update, _empty_archive_text(search), _main_keyboard())
+            return
+        await self._send_seen_listings(update)
+
+    async def _send_seen_listings(self, update: Update) -> bool:
+        search = self._current_search(update)
+        if search is None:
+            await _reply(update, "Не удалось найти поиск.")
+            return False
 
         listings = self.store.listings_seen_for_search(
             int(search["id"]),
@@ -1244,15 +1469,15 @@ class SettingsBot:
         )
         if not listings:
             await _reply(update, "По текущим фильтрам пока ничего не найдено.")
-            return
+            return False
 
         if not self.settings.telegram_bot_token:
             await _reply(update, "TELEGRAM_BOT_TOKEN не задан.")
-            return
+            return False
 
         chat = update.effective_chat
         if chat is None:
-            return
+            return False
 
         await _reply(update, f"Показываю квартир: {len(listings)}")
         notifier = TelegramNotifier(
@@ -1260,12 +1485,7 @@ class SettingsBot:
             chat_id=str(chat.id),
         )
         await asyncio.to_thread(send_listings_sync, notifier, listings)
-        if context.user_data.pop("show_found_after_initial_seed", False):
-            await _reply_with_markup(
-                update,
-                "Я сообщу, когда появятся новые квартиры.",
-                _configure_search_reply_keyboard(),
-            )
+        return True
 
     async def _stop_current_search(self, update: Update) -> None:
         search = self._current_search(update)
@@ -1273,6 +1493,7 @@ class SettingsBot:
             await _reply(update, "Не удалось найти поиск.")
             return
         self.store.update_search(int(search["id"]), is_active=False)
+        self._record_event(EV_NOTIFICATIONS_STOPPED, update)
         await _respond(
             update,
             "Поиск остановлен. Новые объявления по нему больше не будут приходить.",
@@ -1283,6 +1504,11 @@ class SettingsBot:
         search = self._current_search(update)
         if search is None:
             await _reply(update, "Не удалось найти поиск.")
+            return
+        if not self.store.user_has_active_access(int(search["user_id"])):
+            await _respond(
+                update, _trial_offer_text(self.settings), _trial_offer_keyboard(self.settings)
+            )
             return
         search_id = int(search["id"])
         self.store.update_search(search_id, is_active=True, initialized_at=None)
@@ -1307,6 +1533,7 @@ class SettingsBot:
             initialized_at=None,
         )
         self.store.clear_seen_for_search(search_id)
+        self._record_event(EV_SEARCH_DELETED, update)
         await _respond(
             update,
             "Поиск удален. Чтобы начать заново, настройте параметры поиска.",
@@ -1368,7 +1595,7 @@ async def _delete_message(message: Message | None) -> None:
 async def _reply_with_markup(
     update: Update,
     text: str,
-    reply_markup: ReplyKeyboardMarkup | ReplyKeyboardRemove,
+    reply_markup: InlineKeyboardMarkup | ReplyKeyboardMarkup | ReplyKeyboardRemove,
 ) -> None:
     target_message = update.effective_message
     if update.callback_query is not None and update.callback_query.message is not None:
@@ -1408,13 +1635,16 @@ def _main_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("🔍 Настроить поиск", callback_data="cfg:setup"),
+                InlineKeyboardButton("🎯 Настроить фильтры", callback_data="cfg:setup"),
             ],
             [
-                InlineKeyboardButton("🔍 Найти квартиры сейчас", callback_data="cfg:check"),
+                InlineKeyboardButton("⚡ Проверить новые квартиры", callback_data="cfg:check"),
             ],
             [
-                InlineKeyboardButton("⚙️ Настройки поиска", callback_data="cfg:settings"),
+                InlineKeyboardButton("📦 Архив квартир", callback_data="cfg:archive"),
+            ],
+            [
+                InlineKeyboardButton("⚙️ Мой поиск", callback_data="cfg:settings"),
                 InlineKeyboardButton("❓ Как это работает", callback_data="cfg:help"),
             ],
         ]
@@ -1427,14 +1657,6 @@ def _start_reply_keyboard() -> ReplyKeyboardMarkup:
         resize_keyboard=True,
         one_time_keyboard=True,
         input_field_placeholder="Нажмите, чтобы настроить поиск",
-    )
-
-
-def _configure_search_reply_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        [["Меню"]],
-        resize_keyboard=True,
-        input_field_placeholder="Открыть меню",
     )
 
 
@@ -1461,10 +1683,15 @@ def _stopped_search_keyboard() -> InlineKeyboardMarkup:
 def _search_settings_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("Изменить параметры", callback_data="cfg:setup")],
-            [InlineKeyboardButton("Оформить подписку", callback_data="cfg:subscribe")],
-            [InlineKeyboardButton("Приостановить мониторинг", callback_data="cfg:stop")],
-            [InlineKeyboardButton("Удалить поиск", callback_data="cfg:delete")],
+            [InlineKeyboardButton("✏️ Изменить фильтры", callback_data="cfg:setup")],
+            [InlineKeyboardButton("💎 Подписка", callback_data="cfg:subscribe")],
+            [
+                InlineKeyboardButton(
+                    "💬 Связаться с поддержкой", url="https://t.me/FlatPulseSupport"
+                )
+            ],
+            [InlineKeyboardButton("⏸ Остановить уведомления", callback_data="cfg:stop")],
+            [InlineKeyboardButton("🗑 Удалить поиск", callback_data="cfg:delete")],
             [InlineKeyboardButton("Назад", callback_data="cfg:menu")],
         ]
     )
@@ -1564,28 +1791,54 @@ def _show_found_keyboard() -> InlineKeyboardMarkup:
         [
             [
                 InlineKeyboardButton(
-                    "👀 Посмотреть найденные квартиры", callback_data="cfg:show_found"
+                    f"👀 Показать {SHOW_FOUND_LIMIT} квартир", callback_data="cfg:show_found"
                 )
             ],
-            [InlineKeyboardButton("⚙️ Настройки поиска", callback_data="cfg:settings")],
+            [InlineKeyboardButton("Посмотреть позже", callback_data="cfg:show_later")],
         ]
     )
 
 
-def _subscribe_keyboard() -> InlineKeyboardMarkup:
+def _trial_offer_keyboard(settings: Settings) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("Оформить подписку", callback_data="cfg:subscribe")],
+            [
+                InlineKeyboardButton(
+                    f"Попробовать {settings.trial_days} дней бесплатно",
+                    callback_data="cfg:start_trial",
+                )
+            ],
+            [InlineKeyboardButton("Не сейчас", callback_data="cfg:decline_trial")],
+        ]
+    )
+
+
+def _subscribe_keyboard(settings: Settings) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    f"💳 Оплатить {settings.subscription_price_rub} ₽",
+                    callback_data="cfg:subscribe",
+                )
+            ],
             [InlineKeyboardButton("Назад", callback_data="cfg:menu")],
         ]
     )
 
 
-def _payment_keyboard(confirmation_url: str) -> InlineKeyboardMarkup:
+def _payment_keyboard(confirmation_url: str, settings: Settings) -> InlineKeyboardMarkup:
     rows = []
     if confirmation_url:
-        rows.append([InlineKeyboardButton("Перейти к оплате", url=confirmation_url)])
-    rows.append([InlineKeyboardButton("Проверить оплату", callback_data="cfg:check_payment")])
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"💳 Оплатить {settings.subscription_price_rub} ₽",
+                    url=confirmation_url,
+                )
+            ]
+        )
+    rows.append([InlineKeyboardButton("✅ Я оплатил", callback_data="cfg:check_payment")])
     rows.append([InlineKeyboardButton("Назад", callback_data="cfg:menu")])
     return InlineKeyboardMarkup(rows)
 
@@ -1705,15 +1958,16 @@ def _manual_url_keyboard() -> InlineKeyboardMarkup:
 def _first_entry_text() -> str:
     return "\n".join(
         [
-            "🏠 FlatPulse следит за ЦИАН вместо тебя.",
+            "🏠 Найдите квартиру раньше других.",
             "",
-            "Настрой поиск один раз и получай уведомления только о новых квартирах.",
+            "FlatPulse автоматически отслеживает новые объявления на ЦИАН и присылает "
+            "только те, которые подходят под ваши параметры.",
             "",
-            "⚡ Без дублей.",
-            "⚡ Без постоянного обновления сайта.",
-            "⚡ Уведомления сразу после публикации объявления.",
+            "⚡ Только новые объявления",
+            "⚡ Без дублей",
+            "⚡ Без бесконечного обновления ЦИАН",
             "",
-            "Начнем?",
+            "Начнем настройку?",
         ]
     )
 
@@ -1721,13 +1975,12 @@ def _first_entry_text() -> str:
 def _welcome_text() -> str:
     return "\n".join(
         [
-            "🏠 Не проверяйте ЦИАН каждые 10 минут.",
+            "🏠 Хорошие квартиры уходят за часы.",
             "",
-            "FlatPulse сам отслеживает новые квартиры и присылает только свежие объявления "
-            "по вашим параметрам.",
+            "FlatPulse следит за новыми объявлениями на ЦИАН вместо вас и присылает "
+            "только подходящие варианты.",
             "",
-            "Настройте поиск один раз — и получайте уведомления, как только появляется "
-            "подходящий вариант.",
+            "Настройте поиск один раз — и узнавайте о новых квартирах сразу после публикации.",
         ]
     )
 
@@ -1735,14 +1988,40 @@ def _welcome_text() -> str:
 def _initial_seed_text(found: object) -> str:
     return "\n".join(
         [
-            "🎉 Мониторинг запущен.",
+            "✅ Поиск настроен.",
             "",
-            "Я запомнил текущие объявления и буду присылать только новые квартиры, "
-            "которые появятся по вашим параметрам.",
+            f"Я нашел и запомнил текущие объявления: {found}.",
             "",
-            "Без дублей и ручной проверки ЦИАН.",
+            "Можете посмотреть самые свежие варианты сейчас или вернуться к ним позже в архиве.",
+        ]
+    )
+
+
+def _trial_offer_text(settings: Settings) -> str:
+    return "\n".join(
+        [
+            "Хотите получать новые квартиры раньше других?",
             "",
-            f"Уже найдено: {found} квартир.",
+            "FlatPulse будет проверять ЦИАН каждые 10 минут и присылать только свежие объявления "
+            "по вашим фильтрам.",
+            "",
+            f"Попробуйте сейчас за 0 ₽ на {settings.trial_days} дней. "
+            f"После пробного периода — {settings.subscription_price_rub} ₽ в месяц.",
+            "",
+            "Без автосписаний: следующий месяц оплачивается вручную.",
+        ]
+    )
+
+
+def _trial_used_text(settings: Settings) -> str:
+    return "\n".join(
+        [
+            "Бесплатный период уже был использован.",
+            "",
+            f"Чтобы продолжить получать новые квартиры, оплатите следующий месяц вручную: "
+            f"{settings.subscription_price_rub} ₽.",
+            "",
+            "Без автосписаний.",
         ]
     )
 
@@ -1750,21 +2029,32 @@ def _initial_seed_text(found: object) -> str:
 def _payment_required_text(settings: Settings) -> str:
     return "\n".join(
         [
-            "Пробный период закончился.",
+            "⏳ Пробный период закончился.",
             "",
-            f"Чтобы продолжить получать новые квартиры, оформите подписку за {settings.subscription_price_rub} ₽ в месяц.",
+            "FlatPulse уже знает ваши параметры поиска, но новые уведомления сейчас на паузе.",
+            "",
+            f"Подписка стоит {settings.subscription_price_rub} ₽ в месяц.",
+            "После оплаты бот продолжит присылать только новые подходящие квартиры.",
+            "",
+            "Без автосписаний: следующий месяц оплачивается вручную.",
         ]
     )
 
 
-def _payment_created_text(confirmation_url: str) -> str:
+def _payment_created_text(settings: Settings) -> str:
     return "\n".join(
         [
-            "Платеж создан.",
+            "💳 Подписка FlatPulse",
             "",
-            "Перейдите к оплате, а после успешной оплаты нажмите Проверить оплату.",
+            "Что входит:",
+            "• автоматическая проверка новых квартир;",
+            "• уведомления только по вашим фильтрам;",
+            "• защита от дублей.",
             "",
-            confirmation_url,
+            f"Стоимость: {settings.subscription_price_rub} ₽ в месяц.",
+            "Без автосписаний: следующий месяц оплачивается вручную.",
+            "",
+            "После оплаты вернитесь в бот и нажмите «✅ Я оплатил».",
         ]
     )
 
@@ -1778,6 +2068,7 @@ def _dev_payment_screen_text(settings: Settings) -> str:
             "Подписка на Telegram-бота для отслеживания новых объявлений о сдаче квартир на ЦИАН.",
             "",
             f"Стоимость: {settings.subscription_price_rub} ₽ в месяц.",
+            "Оплата вручную, без автосписаний.",
         ]
     )
 
@@ -1791,6 +2082,8 @@ def _help_text() -> str:
             "3. Дальше бот будет присылать только новые подходящие квартиры.",
             "",
             "Если вариантов мало, расширьте бюджет, комнаты или область поиска.",
+            "",
+            "Если нужна помощь, напишите в поддержку: @FlatPulseSupport",
         ]
     )
 
@@ -1800,9 +2093,12 @@ def _format_settings(
     *,
     status: str | None = None,
     found_count: int | None = None,
+    access_status: str | None = None,
 ) -> str:
     status_line = "✅ Поиск активен" if status == "активен" else f"Поиск: {status or 'не настроен'}"
     lines = [status_line]
+    if access_status is not None:
+        lines.append(access_status)
     lines.extend(
         [
             f"📍 {settings.cian_city}",
@@ -1814,21 +2110,46 @@ def _format_settings(
     )
     if found_count is not None:
         lines.append(f"🔥 Сейчас найдено: {found_count} квартир")
-    lines.append("Новые объявления будут приходить автоматически.")
+    if status == "остановлен":
+        lines.append("Новые объявления сейчас не приходят.")
+    else:
+        lines.append("Новые объявления будут приходить автоматически.")
     return "\n".join(lines)
+
+
+def _empty_archive_text(search: dict[str, object]) -> str:
+    if not search.get("initialized_at"):
+        return "\n".join(
+            [
+                "📦 Архив пока пуст.",
+                "",
+                "Сначала настройте поиск и запустите первую проверку. После этого найденные квартиры появятся здесь.",
+            ]
+        )
+    return "\n".join(
+        [
+            "📦 В архиве пока нет квартир.",
+            "",
+            "По текущим фильтрам ничего не найдено. Попробуйте расширить бюджет, комнаты или область поиска.",
+        ]
+    )
 
 
 def _search_configured_text(settings: Settings, *, found: object) -> str:
     return "\n".join(
         [
             "✅ Поиск настроен",
+            "",
             f"📍 Город: {settings.cian_city}",
             f"🏠 Комнаты: {_format_rooms(settings.cian_rooms)}",
             f"💰 Бюджет: {_format_price(settings.cian_min_price, settings.cian_max_price)}",
             f"📅 Аренда: {_format_rent(settings.cian_rent_type)}",
+            "",
             f"🔥 Уже найдено: {found} квартир",
             "",
-            "Я запомнил текущие объявления. Дальше буду присылать только новые варианты.",
+            "Я сохранил текущие объявления и больше не буду показывать их повторно.",
+            "",
+            "Можете посмотреть свежие варианты сейчас или вернуться к ним позже в архиве.",
         ]
     )
 
@@ -1883,6 +2204,10 @@ def _format_admin_status(store: ListingStore, settings: Settings) -> str:
             f"Found: {last_run['listings_found']}",
             f"New: {last_run['new_listings']}",
             f"Sent: {last_run['notifications_sent']}",
+            f"Groups: active={last_run.get('active_searches', 0)} "
+            f"unique={last_run.get('unique_search_groups', 0)} "
+            f"fetches={last_run.get('cian_fetches', 0)} "
+            f"shared={last_run.get('shared_group_hits', 0)}",
         ]
     )
     if last_run.get("error"):
@@ -1933,7 +2258,56 @@ def _format_admin_health(store: ListingStore, settings: Settings) -> str:
             f"Last status: {last_run['status']}",
             f"Last found: {last_run['listings_found']}",
             f"Last sent: {last_run['notifications_sent']}",
+            f"Last groups: active={last_run.get('active_searches', 0)} "
+            f"unique={last_run.get('unique_search_groups', 0)} "
+            f"fetches={last_run.get('cian_fetches', 0)} "
+            f"shared={last_run.get('shared_group_hits', 0)}",
         ]
+    )
+    return "\n".join(lines)
+
+
+def _format_admin_metrics(store: ListingStore) -> str:
+    return "\n\n".join(
+        [
+            _format_metrics_period(store, title="Metrics 24h", hours=24),
+            _format_metrics_period(store, title="Metrics 7d", hours=24 * 7),
+        ]
+    )
+
+
+def _format_metrics_period(store: ListingStore, *, title: str, hours: int) -> str:
+    since = (datetime.now(UTC) - timedelta(hours=hours)).isoformat(timespec="seconds")
+    event_counts = store.analytics_events_summary_since(since)
+    run_summary = store.check_runs_summary_since(since)
+    metric_rows = [
+        ("users_total", store.users_count()),
+        ("users_active", store.users_count(active=True)),
+        ("searches_active", store.searches_count_by_status(active=True)),
+        ("trial_started", event_counts.get(EV_TRIAL_STARTED, 0)),
+        ("trial_expired", event_counts.get(EV_TRIAL_EXPIRED, 0)),
+        ("payments_created", event_counts.get(EV_PAYMENT_CREATED, 0)),
+        ("payments_succeeded", event_counts.get(EV_PAYMENT_SUCCEEDED, 0)),
+        ("manual_checks", event_counts.get(EV_MANUAL_CHECK, 0)),
+        ("listings_found", run_summary["listings_found"]),
+        ("new_listings_sent", run_summary["notifications_sent"]),
+        ("parser_errors", event_counts.get(EV_PARSER_ERROR, 0)),
+        ("captcha_errors", event_counts.get(EV_CAPTCHA_ERROR, 0)),
+        ("empty_parse_errors", event_counts.get(EV_EMPTY_PARSE_ERROR, 0)),
+        ("telegram_send_errors", event_counts.get(EV_TELEGRAM_SEND_ERROR, 0)),
+    ]
+    lines = [title]
+    lines.extend(f"{name}: {value}" for name, value in metric_rows)
+    lines.append(
+        "groups: "
+        f"active={run_summary['active_searches']} "
+        f"unique={run_summary['unique_search_groups']} "
+        f"fetches={run_summary['cian_fetches']} "
+        f"shared={run_summary['shared_group_hits']}"
+    )
+    lines.append("Funnel")
+    lines.extend(
+        f"{label}: {event_counts.get(event_name, 0)}" for event_name, label in FUNNEL_EVENTS
     )
     return "\n".join(lines)
 
@@ -2044,17 +2418,26 @@ def _manual_check_cooldown_remaining(
         return 0
 
     now = now or datetime.now(UTC)
-    try:
-        last_check = datetime.fromisoformat(last_check_at)
-    except ValueError:
+    last_check = _parse_state_datetime(last_check_at)
+    if last_check is None:
         return 0
-    if last_check.tzinfo is None:
-        last_check = last_check.replace(tzinfo=UTC)
 
     remaining = cooldown_seconds - (now - last_check).total_seconds()
     if remaining <= 0:
         return 0
     return math.ceil(remaining)
+
+
+def _parse_state_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed
 
 
 def _format_timestamp(value: object) -> str:

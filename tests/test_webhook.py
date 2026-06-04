@@ -1,11 +1,13 @@
 from dataclasses import replace
 from datetime import datetime
+from io import BytesIO
 from pathlib import Path
 
 from cian_rent_alerts.analytics import EV_PAYMENT_SUCCEEDED, EV_WEBHOOK_ERROR
 from cian_rent_alerts.config import Settings
 from cian_rent_alerts.db import ListingStore
 from cian_rent_alerts.webhook import (
+    _build_handler,
     _health_response,
     _redact_webhook_secret,
     process_yookassa_webhook,
@@ -167,3 +169,30 @@ def test_webhook_health_endpoint(tmp_path: Path) -> None:
     assert status_code == 200
     assert payload == {"status": "ok", "db": "ok"}
     assert "secret-value" not in str(payload)
+
+
+def test_webhook_health_endpoint_accepts_head(tmp_path: Path) -> None:
+    settings = replace(
+        Settings.from_env(env_file=None),
+        database_path=tmp_path / "test.sqlite3",
+        database_url=None,
+        yookassa_webhook_secret="secret-value",
+    )
+    store = ListingStore(settings.database_path)
+    store.init()
+    handler_cls = _build_handler(settings, store)
+    handler = handler_cls.__new__(handler_cls)
+    headers: dict[str, str] = {}
+    status_codes: list[int] = []
+    handler.path = "/health"
+    handler.wfile = BytesIO()
+    handler.send_response = status_codes.append
+    handler.send_header = headers.__setitem__
+    handler.end_headers = lambda: None
+
+    handler.do_HEAD()
+
+    assert status_codes == [200]
+    assert headers["Content-Type"] == "application/json"
+    assert headers["Content-Length"] == "28"
+    assert handler.wfile.getvalue() == b""

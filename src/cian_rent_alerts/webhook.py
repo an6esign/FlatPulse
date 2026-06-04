@@ -151,6 +151,15 @@ def _build_handler(settings: Settings, store: ListingStore) -> type[BaseHTTPRequ
             status_code, payload = _health_response(store)
             self._write_json(status_code, payload)
 
+        def do_HEAD(self) -> None:
+            parsed = urlparse(self.path)
+            if parsed.path != "/health":
+                self._write_json(404, {"status": "not_found"}, include_body=False)
+                return
+
+            status_code, payload = _health_response(store)
+            self._write_json(status_code, payload, include_body=False)
+
         def do_POST(self) -> None:
             parsed = urlparse(self.path)
             expected_path = f"/webhooks/yookassa/{settings.yookassa_webhook_secret}"
@@ -187,13 +196,20 @@ def _build_handler(settings: Settings, store: ListingStore) -> type[BaseHTTPRequ
             )
             logger.info("Webhook request: " + format, *safe_args)
 
-        def _write_json(self, status_code: int, payload: dict[str, object]) -> None:
+        def _write_json(
+            self,
+            status_code: int,
+            payload: dict[str, object],
+            *,
+            include_body: bool = True,
+        ) -> None:
             data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             self.send_response(status_code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
-            self.wfile.write(data)
+            if include_body:
+                self.wfile.write(data)
 
     return YooKassaWebhookHandler
 

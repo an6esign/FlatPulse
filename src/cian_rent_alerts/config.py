@@ -40,6 +40,16 @@ def _as_int(name: str, default: int) -> int:
         raise ConfigError(f"{name} must be an integer") from exc
 
 
+def _as_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except ValueError as exc:
+        raise ConfigError(f"{name} must be a number") from exc
+
+
 def _as_optional_int(name: str) -> int | None:
     value = os.getenv(name)
     if value is None or value == "":
@@ -93,6 +103,9 @@ class Settings:
     telegram_bot_token: str | None
     telegram_chat_id: str | None
     admin_telegram_ids: frozenset[str]
+    telegram_rate_limit_seconds: float
+    telegram_retry_attempts: int
+    telegram_retry_backoff_seconds: float
     database_url: str | None
     database_path: Path
     parser_debug_dir: Path | None
@@ -125,6 +138,8 @@ class Settings:
     monitoring_captcha_error_threshold: int
     monitoring_telegram_error_threshold: int
     monitoring_webhook_error_threshold: int
+    manual_check_cooldown_seconds: int
+    callback_cooldown_seconds: float
     subscription_price_rub: int
     subscription_period_days: int
     trial_days: int
@@ -151,6 +166,11 @@ class Settings:
             telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN"),
             telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID"),
             admin_telegram_ids=_as_csv_set(os.getenv("ADMIN_TELEGRAM_IDS")),
+            telegram_rate_limit_seconds=max(_as_float("TELEGRAM_RATE_LIMIT_SECONDS", 0.4), 0),
+            telegram_retry_attempts=max(_as_int("TELEGRAM_RETRY_ATTEMPTS", 3), 1),
+            telegram_retry_backoff_seconds=max(
+                _as_float("TELEGRAM_RETRY_BACKOFF_SECONDS", 2.0), 0
+            ),
             database_url=os.getenv("DATABASE_URL") or None,
             database_path=Path(os.getenv("DATABASE_PATH", "data/listings.sqlite3")),
             parser_debug_dir=_as_optional_path(os.getenv("PARSER_DEBUG_DIR")),
@@ -199,6 +219,8 @@ class Settings:
             monitoring_webhook_error_threshold=max(
                 _as_int("MONITORING_WEBHOOK_ERROR_THRESHOLD", 1), 0
             ),
+            manual_check_cooldown_seconds=max(_as_int("MANUAL_CHECK_COOLDOWN_SECONDS", 180), 0),
+            callback_cooldown_seconds=max(_as_float("CALLBACK_COOLDOWN_SECONDS", 2.0), 0),
             subscription_price_rub=max(_as_int("SUBSCRIPTION_PRICE_RUB", 199), 1),
             subscription_period_days=max(_as_int("SUBSCRIPTION_PERIOD_DAYS", 31), 1),
             trial_days=max(_as_int("TRIAL_DAYS", 7), 0),

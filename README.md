@@ -224,6 +224,30 @@ PARSER_NETWORK_COOLDOWN_SECONDS=900
 `PARSER_PROBLEM_COOLDOWN_SECONDS` применяется для `captcha` и `empty_parse`,
 `PARSER_NETWORK_COOLDOWN_SECONDS` - для сетевых ошибок после retry.
 
+Telegram-отправка идет через общий лимитер и retry:
+
+```env
+TELEGRAM_RATE_LIMIT_SECONDS=0.4
+TELEGRAM_RETRY_ATTEMPTS=3
+TELEGRAM_RETRY_BACKOFF_SECONDS=2
+```
+
+`TELEGRAM_RATE_LIMIT_SECONDS` задает минимальную паузу между сообщениями,
+`TELEGRAM_RETRY_ATTEMPTS` и `TELEGRAM_RETRY_BACKOFF_SECONDS` используются для
+временных сетевых ошибок Telegram. Если Telegram возвращает `RetryAfter`,
+сервис ждет указанную Telegram паузу.
+
+Ручные проверки и быстрые повторные нажатия ограничиваются cooldown-ами:
+
+```env
+MANUAL_CHECK_COOLDOWN_SECONDS=180
+CALLBACK_COOLDOWN_SECONDS=2
+```
+
+`MANUAL_CHECK_COOLDOWN_SECONDS` защищает парсер от частых ручных проверок одним
+пользователем. `CALLBACK_COOLDOWN_SECONDS` отсекает быстрые повторные нажатия по
+одной и той же кнопке.
+
 При `captcha` или `empty_parse` сервис сохраняет HTML страницы для диагностики:
 
 ```env

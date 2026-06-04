@@ -25,7 +25,7 @@ from .cian_url import build_cian_search_url
 from .config import ConfigError, Settings
 from .db import ListingStore
 from .models import Listing
-from .notifier import TelegramNotifier, send_listings_sync, send_message_sync
+from .notifier import TelegramNotifier, TelegramSendPolicy, send_listings_sync, send_message_sync
 from .scraper import (
     CaptchaError,
     EmptyParseError,
@@ -249,10 +249,22 @@ def run_monitoring(settings: Settings) -> None:
     text = "\n".join(["FlatPulse: мониторинг", *[f"- {problem}" for problem in problems]])
     for chat_id in settings.admin_telegram_ids:
         try:
-            notifier = TelegramNotifier(settings.telegram_bot_token or "", chat_id=chat_id)
+            notifier = _telegram_notifier(settings, chat_id)
             send_message_sync(notifier, text)
         except Exception:
             logger.exception("Failed to send monitoring alert to chat_id=%s", chat_id)
+
+
+def _telegram_notifier(settings: Settings, chat_id: str) -> TelegramNotifier:
+    return TelegramNotifier(
+        token=settings.telegram_bot_token or "",
+        chat_id=chat_id,
+        send_policy=TelegramSendPolicy(
+            rate_limit_seconds=settings.telegram_rate_limit_seconds,
+            retry_attempts=settings.telegram_retry_attempts,
+            retry_backoff_seconds=settings.telegram_retry_backoff_seconds,
+        ),
+    )
 
 
 def _monitoring_problems(store: ListingStore, settings: Settings) -> list[str]:
@@ -536,10 +548,7 @@ def _run_check(
                         _remember_search_activity_checkpoint(store, search)
                         continue
 
-                    notifier = TelegramNotifier(
-                        token=search_settings.telegram_bot_token or "",
-                        chat_id=chat_id,
-                    )
+                    notifier = _telegram_notifier(search_settings, chat_id)
                     sent_ids = send_listings_sync(notifier, unseen)
                     notifications_sent += len(sent_ids)
                     store.mark_many_search_listings_seen(
@@ -662,10 +671,7 @@ def _run_global_check(store: ListingStore, settings: Settings) -> dict[str, int]
         }
 
     effective_settings.require_telegram()
-    notifier = TelegramNotifier(
-        token=effective_settings.telegram_bot_token or "",
-        chat_id=effective_settings.telegram_chat_id or "",
-    )
+    notifier = _telegram_notifier(effective_settings, effective_settings.telegram_chat_id or "")
     sent_ids = send_listings_sync(notifier, unsent)
     notifications_sent = len(sent_ids)
     for cian_id in sent_ids:
@@ -810,10 +816,7 @@ def _notify_admins_about_check_problem(
     text = _format_admin_problem_message(status=status, run_id=run_id, error=error)
     for chat_id in settings.admin_telegram_ids:
         try:
-            notifier = TelegramNotifier(
-                token=settings.telegram_bot_token,
-                chat_id=chat_id,
-            )
+            notifier = _telegram_notifier(settings, chat_id)
             send_message_sync(notifier, text)
         except Exception:
             logger.exception("Failed to send admin problem notification to chat_id=%s", chat_id)
@@ -877,10 +880,7 @@ def _maybe_notify_no_new_listings(
         return
 
     try:
-        notifier = TelegramNotifier(
-            token=settings.telegram_bot_token,
-            chat_id=str(search["telegram_chat_id"]),
-        )
+        notifier = _telegram_notifier(settings, str(search["telegram_chat_id"]))
         send_message_sync(
             notifier,
             _no_new_listings_nudge_text(),
@@ -915,10 +915,7 @@ def _maybe_notify_payment_required(
         return
 
     try:
-        notifier = TelegramNotifier(
-            token=settings.telegram_bot_token,
-            chat_id=str(search["telegram_chat_id"]),
-        )
+        notifier = _telegram_notifier(settings, str(search["telegram_chat_id"]))
         send_message_sync(
             notifier,
             _payment_required_text(settings),

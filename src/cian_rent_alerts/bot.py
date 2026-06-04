@@ -4,7 +4,7 @@ import asyncio
 import logging
 import math
 import re
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, MutableMapping
 from datetime import UTC, datetime, timedelta
 
 from telegram import (
@@ -32,6 +32,7 @@ from .analytics import (
     EV_FILTERS_COMPLETED,
     EV_INITIAL_SEARCH_SUCCESS,
     EV_MANUAL_CHECK,
+    EV_MANUAL_CHECK_BLOCKED,
     EV_NOTIFICATIONS_STOPPED,
     EV_PAYMENT_CREATED,
     EV_PAYMENT_OPENED,
@@ -63,7 +64,8 @@ logger = logging.getLogger(__name__)
 
 Handler = Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[None]]
 SHOW_FOUND_LIMIT = 10
-MANUAL_CHECK_COOLDOWN_SECONDS = 60
+MANUAL_CHECK_COOLDOWN_SECONDS = 180
+CALLBACK_COOLDOWN_SECONDS = 2.0
 START_DEDUP_WINDOW_SECONDS = 3
 
 
@@ -751,11 +753,21 @@ class SettingsBot:
 
         user_id = int(search["user_id"])
         last_manual_check_at = self.store.get_user_state(user_id, "last_manual_check_at")
-        cooldown_remaining = _manual_check_cooldown_remaining(last_manual_check_at)
+        cooldown_remaining = _manual_check_cooldown_remaining(
+            last_manual_check_at,
+            cooldown_seconds=self.settings.manual_check_cooldown_seconds,
+        )
         if cooldown_remaining > 0:
+            self._record_event(
+                EV_MANUAL_CHECK_BLOCKED,
+                update,
+                metadata={"remaining_seconds": cooldown_remaining},
+            )
             await _reply(
                 update,
-                f"Проверка уже запускалась недавно. Попробуйте через {cooldown_remaining} сек.",
+                "Проверка уже была недавно.\n\n"
+                "Новые объявления я пришлю автоматически, как только они появятся.\n"
+                f"Повторно проверить можно через {cooldown_remaining} сек.",
             )
             return
 
@@ -844,9 +856,19 @@ class SettingsBot:
         query = update.callback_query
         if query is None or query.data is None:
             return
-        await query.answer()
 
         action = query.data
+        callback_cooldown_remaining = _callback_cooldown_remaining(
+            context.user_data,
+            action,
+            cooldown_seconds=self.settings.callback_cooldown_seconds,
+        )
+        if callback_cooldown_remaining > 0:
+            await query.answer("Подождите пару секунд.", show_alert=False)
+            return
+        _remember_callback_action(context.user_data, action)
+        await query.answer()
+
         if action == "cfg:menu":
             await _respond(update, _welcome_text(), _main_keyboard())
             return
@@ -2260,7 +2282,12 @@ def _format_admin_health(store: ListingStore, settings: Settings) -> str:
         f"Searches: {searches_total} total, {searches_active} active, {cooldown_searches} cooldown",
         f"Parser: {_format_parser_mode(settings)}, retry={settings.parser_retry_attempts} "
         f"backoff={_format_interval(settings.parser_retry_backoff_seconds)}",
+        f"Telegram: rate_limit={_format_interval(settings.telegram_rate_limit_seconds)} "
+        f"retry={settings.telegram_retry_attempts} "
+        f"backoff={_format_interval(settings.telegram_retry_backoff_seconds)}",
         f"Limits: search_delay={_format_interval(settings.search_check_delay_seconds)} "
+        f"manual_check={_format_interval(settings.manual_check_cooldown_seconds)} "
+        f"callback={_format_interval(settings.callback_cooldown_seconds)} "
         f"problem_cooldown={_format_interval(settings.parser_problem_cooldown_seconds)} "
         f"network_cooldown={_format_interval(settings.parser_network_cooldown_seconds)}",
         f"Last 24h: runs={daily_summary['runs']} partial={daily_summary['partial_runs']} "
@@ -2307,6 +2334,7 @@ def _format_metrics_period(store: ListingStore, *, title: str, hours: int) -> st
         ("payments_created", event_counts.get(EV_PAYMENT_CREATED, 0)),
         ("payments_succeeded", event_counts.get(EV_PAYMENT_SUCCEEDED, 0)),
         ("manual_checks", event_counts.get(EV_MANUAL_CHECK, 0)),
+        ("manual_checks_blocked", event_counts.get(EV_MANUAL_CHECK_BLOCKED, 0)),
         ("listings_found", run_summary["listings_found"]),
         ("new_listings_sent", run_summary["notifications_sent"]),
         ("parser_errors", event_counts.get(EV_PARSER_ERROR, 0)),
@@ -2438,11 +2466,13 @@ def _format_check_runs(title: str, runs: list[dict[str, object]]) -> str:
     return "\n".join(lines)
 
 
-def _format_interval(seconds: int) -> str:
+def _format_interval(seconds: int | float) -> str:
     minutes, rest = divmod(seconds, 60)
     if minutes and not rest:
-        return f"{minutes} min"
-    return f"{seconds} sec"
+        return f"{int(minutes)} min"
+    if isinstance(seconds, float) and not seconds.is_integer():
+        return f"{seconds:g} sec"
+    return f"{int(seconds)} sec"
 
 
 def _format_parser_mode(settings: Settings) -> str:
@@ -2471,6 +2501,41 @@ def _manual_check_cooldown_remaining(
     if remaining <= 0:
         return 0
     return math.ceil(remaining)
+
+
+def _callback_cooldown_remaining(
+    user_data: MutableMapping[str, object],
+    action: str,
+    *,
+    now: datetime | None = None,
+    cooldown_seconds: float = CALLBACK_COOLDOWN_SECONDS,
+) -> int:
+    if cooldown_seconds <= 0:
+        return 0
+    if user_data.get("last_callback_action") != action:
+        return 0
+
+    last_callback_at = _parse_state_datetime(
+        str(user_data.get("last_callback_at") or "")
+    )
+    if last_callback_at is None:
+        return 0
+
+    now = now or datetime.now(UTC)
+    remaining = cooldown_seconds - (now - last_callback_at).total_seconds()
+    if remaining <= 0:
+        return 0
+    return math.ceil(remaining)
+
+
+def _remember_callback_action(
+    user_data: MutableMapping[str, object],
+    action: str,
+    *,
+    now: datetime | None = None,
+) -> None:
+    user_data["last_callback_action"] = action
+    user_data["last_callback_at"] = (now or datetime.now(UTC)).isoformat(timespec="seconds")
 
 
 def _parse_state_datetime(value: str | None) -> datetime | None:

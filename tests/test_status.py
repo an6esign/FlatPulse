@@ -13,7 +13,12 @@ from cian_rent_alerts.bot import (
 )
 from cian_rent_alerts.config import Settings
 from cian_rent_alerts.db import ListingStore
-from cian_rent_alerts.analytics import EV_MANUAL_CHECK, EV_TRIAL_STARTED, EV_WEBHOOK_ERROR
+from cian_rent_alerts.analytics import (
+    EV_MANUAL_CHECK,
+    EV_MANUAL_CHECK_BLOCKED,
+    EV_TRIAL_STARTED,
+    EV_WEBHOOK_ERROR,
+)
 
 
 def test_store_last_check_run(tmp_path: Path) -> None:
@@ -146,7 +151,12 @@ def test_admin_monitoring_counts_and_formatters(tmp_path: Path) -> None:
         playwright_fallback=True,
         parser_retry_attempts=3,
         parser_retry_backoff_seconds=2,
+        telegram_rate_limit_seconds=0.4,
+        telegram_retry_attempts=3,
+        telegram_retry_backoff_seconds=2,
         search_check_delay_seconds=5,
+        manual_check_cooldown_seconds=180,
+        callback_cooldown_seconds=2,
         parser_problem_cooldown_seconds=3600,
         parser_network_cooldown_seconds=900,
     )
@@ -165,7 +175,10 @@ def test_admin_monitoring_counts_and_formatters(tmp_path: Path) -> None:
     assert "Health: degraded" in health_text
     assert "partial=1" in health_text
     assert "Parser: requests+playwright_fallback, retry=3 backoff=2 sec" in health_text
+    assert "Telegram: rate_limit=0.4 sec retry=3 backoff=2 sec" in health_text
     assert "search_delay=5 sec" in health_text
+    assert "manual_check=3 min" in health_text
+    assert "callback=2 sec" in health_text
     assert "problem_cooldown=60 min" in health_text
     assert "network_cooldown=15 min" in health_text
     assert "Admin health" in report_text
@@ -204,6 +217,7 @@ def test_format_admin_metrics(tmp_path: Path) -> None:
         shared_group_hits=1,
     )
     store.record_event(EV_MANUAL_CHECK, user_id=user_id, search_id=search_id)
+    store.record_event(EV_MANUAL_CHECK_BLOCKED, user_id=user_id, search_id=search_id)
     store.record_event(EV_TRIAL_STARTED, user_id=user_id, search_id=search_id)
     store.record_event(EV_WEBHOOK_ERROR, metadata={"reason": "bad_request"})
 
@@ -214,6 +228,7 @@ def test_format_admin_metrics(tmp_path: Path) -> None:
     assert "searches_active: 1" in text
     assert "trial_started: 1" in text
     assert "manual_checks: 1" in text
+    assert "manual_checks_blocked: 1" in text
     assert "webhook_errors: 1" in text
     assert "listings_found: 12" in text
     assert "new_listings_sent: 3" in text

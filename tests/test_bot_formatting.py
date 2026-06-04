@@ -2,6 +2,7 @@ from datetime import UTC, datetime
 
 from cian_rent_alerts.bot import (
     SHOW_FOUND_LIMIT,
+    _callback_cooldown_remaining,
     _default_user_search_values,
     _dev_payment_screen_keyboard,
     _dev_payment_screen_text,
@@ -18,6 +19,7 @@ from cian_rent_alerts.bot import (
     _parse_manual_price,
     _parse_manual_rent,
     _parse_manual_rooms,
+    _remember_callback_action,
     _start_reply_keyboard,
     _stopped_search_keyboard,
     _trial_offer_keyboard,
@@ -249,6 +251,51 @@ def test_manual_check_cooldown_blocks_repeated_checks() -> None:
             last_check_at,
             now=datetime(2026, 5, 31, 10, 1, 1, tzinfo=UTC),
             cooldown_seconds=60,
+        )
+        == 0
+    )
+
+
+def test_callback_cooldown_blocks_repeated_same_action() -> None:
+    user_data: dict[str, object] = {}
+    now = datetime(2026, 5, 31, 10, 0, 0, tzinfo=UTC)
+
+    assert (
+        _callback_cooldown_remaining(
+            user_data,
+            "cfg:check",
+            now=now,
+            cooldown_seconds=2,
+        )
+        == 0
+    )
+
+    _remember_callback_action(user_data, "cfg:check", now=now)
+
+    assert (
+        _callback_cooldown_remaining(
+            user_data,
+            "cfg:check",
+            now=datetime(2026, 5, 31, 10, 0, 1, tzinfo=UTC),
+            cooldown_seconds=2,
+        )
+        == 1
+    )
+    assert (
+        _callback_cooldown_remaining(
+            user_data,
+            "cfg:settings",
+            now=datetime(2026, 5, 31, 10, 0, 1, tzinfo=UTC),
+            cooldown_seconds=2,
+        )
+        == 0
+    )
+    assert (
+        _callback_cooldown_remaining(
+            user_data,
+            "cfg:check",
+            now=datetime(2026, 5, 31, 10, 0, 3, tzinfo=UTC),
+            cooldown_seconds=2,
         )
         == 0
     )

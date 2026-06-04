@@ -176,7 +176,13 @@ def _build_handler(settings: Settings, store: ListingStore) -> type[BaseHTTPRequ
             self._write_json(200, {"status": result.status})
 
         def log_message(self, format: str, *args: object) -> None:
-            logger.info("Webhook request: " + format, *args)
+            safe_args = tuple(
+                _redact_webhook_secret(str(arg), settings.yookassa_webhook_secret)
+                if isinstance(arg, str)
+                else arg
+                for arg in args
+            )
+            logger.info("Webhook request: " + format, *safe_args)
 
         def _write_json(self, status_code: int, payload: dict[str, object]) -> None:
             data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -194,6 +200,12 @@ def _content_length(handler: BaseHTTPRequestHandler) -> int:
         return max(int(handler.headers.get("Content-Length", "0")), 0)
     except ValueError:
         return 0
+
+
+def _redact_webhook_secret(value: str, secret: str | None) -> str:
+    if not secret:
+        return value
+    return value.replace(f"/webhooks/yookassa/{secret}", "/webhooks/yookassa/<secret>")
 
 
 def _record_webhook_error(store: ListingStore, reason: str) -> None:

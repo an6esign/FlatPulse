@@ -5,7 +5,7 @@ from pathlib import Path
 from cian_rent_alerts.analytics import EV_PAYMENT_SUCCEEDED, EV_WEBHOOK_ERROR
 from cian_rent_alerts.config import Settings
 from cian_rent_alerts.db import ListingStore
-from cian_rent_alerts.webhook import process_yookassa_webhook
+from cian_rent_alerts.webhook import _redact_webhook_secret, process_yookassa_webhook
 
 
 def test_yookassa_webhook_grants_paid_access_once(tmp_path: Path) -> None:
@@ -137,3 +137,12 @@ def test_yookassa_webhook_ignores_unknown_payment(tmp_path: Path) -> None:
 
     assert result.status == "unknown_payment"
     assert summary[EV_WEBHOOK_ERROR] == 1
+
+
+def test_webhook_log_redacts_secret() -> None:
+    text = 'POST /webhooks/yookassa/secret-value HTTP/1.1" 200 -'
+
+    redacted = _redact_webhook_secret(text, "secret-value")
+
+    assert "secret-value" not in redacted
+    assert "/webhooks/yookassa/<secret>" in redacted

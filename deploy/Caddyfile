@@ -1,4 +1,8 @@
 {$WEBHOOK_DOMAIN} {
+	handle /health {
+		reverse_proxy webhook:{$WEBHOOK_PORT}
+	}
+
 	handle /webhooks/yookassa/* {
 		reverse_proxy webhook:{$WEBHOOK_PORT}
 	}

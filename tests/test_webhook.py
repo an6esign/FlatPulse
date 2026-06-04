@@ -5,7 +5,11 @@ from pathlib import Path
 from cian_rent_alerts.analytics import EV_PAYMENT_SUCCEEDED, EV_WEBHOOK_ERROR
 from cian_rent_alerts.config import Settings
 from cian_rent_alerts.db import ListingStore
-from cian_rent_alerts.webhook import _redact_webhook_secret, process_yookassa_webhook
+from cian_rent_alerts.webhook import (
+    _health_response,
+    _redact_webhook_secret,
+    process_yookassa_webhook,
+)
 
 
 def test_yookassa_webhook_grants_paid_access_once(tmp_path: Path) -> None:
@@ -146,3 +150,20 @@ def test_webhook_log_redacts_secret() -> None:
 
     assert "secret-value" not in redacted
     assert "/webhooks/yookassa/<secret>" in redacted
+
+
+def test_webhook_health_endpoint(tmp_path: Path) -> None:
+    settings = replace(
+        Settings.from_env(env_file=None),
+        database_path=tmp_path / "test.sqlite3",
+        database_url=None,
+        yookassa_webhook_secret="secret-value",
+    )
+    store = ListingStore(settings.database_path)
+    store.init()
+
+    status_code, payload = _health_response(store)
+
+    assert status_code == 200
+    assert payload == {"status": "ok", "db": "ok"}
+    assert "secret-value" not in str(payload)

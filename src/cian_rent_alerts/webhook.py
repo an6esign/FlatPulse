@@ -142,6 +142,15 @@ def _notify_user_about_payment(
 
 def _build_handler(settings: Settings, store: ListingStore) -> type[BaseHTTPRequestHandler]:
     class YooKassaWebhookHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            parsed = urlparse(self.path)
+            if parsed.path != "/health":
+                self._write_json(404, {"status": "not_found"})
+                return
+
+            status_code, payload = _health_response(store)
+            self._write_json(status_code, payload)
+
         def do_POST(self) -> None:
             parsed = urlparse(self.path)
             expected_path = f"/webhooks/yookassa/{settings.yookassa_webhook_secret}"
@@ -194,6 +203,15 @@ def _content_length(handler: BaseHTTPRequestHandler) -> int:
         return max(int(handler.headers.get("Content-Length", "0")), 0)
     except ValueError:
         return 0
+
+
+def _health_response(store: ListingStore) -> tuple[int, dict[str, object]]:
+    try:
+        store.ping()
+    except Exception:
+        logger.exception("Webhook healthcheck failed")
+        return 503, {"status": "error", "db": "error"}
+    return 200, {"status": "ok", "db": "ok"}
 
 
 def _redact_webhook_secret(value: str, secret: str | None) -> str:

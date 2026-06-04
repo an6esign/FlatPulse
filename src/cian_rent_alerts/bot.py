@@ -47,6 +47,7 @@ from .analytics import (
     EV_TRIAL_STARTED,
     EV_PARSER_ERROR,
     FUNNEL_EVENTS,
+    EV_WEBHOOK_ERROR,
 )
 from .cian_locations import find_cian_location
 from .cian_url import extract_polygon
@@ -2295,6 +2296,7 @@ def _format_metrics_period(store: ListingStore, *, title: str, hours: int) -> st
         ("captcha_errors", event_counts.get(EV_CAPTCHA_ERROR, 0)),
         ("empty_parse_errors", event_counts.get(EV_EMPTY_PARSE_ERROR, 0)),
         ("telegram_send_errors", event_counts.get(EV_TELEGRAM_SEND_ERROR, 0)),
+        ("webhook_errors", event_counts.get(EV_WEBHOOK_ERROR, 0)),
     ]
     lines = [title]
     lines.extend(f"{name}: {value}" for name, value in metric_rows)

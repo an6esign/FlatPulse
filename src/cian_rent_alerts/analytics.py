@@ -20,6 +20,7 @@ EV_PARSER_ERROR = "parser_error"
 EV_CAPTCHA_ERROR = "captcha_error"
 EV_EMPTY_PARSE_ERROR = "empty_parse_error"
 EV_TELEGRAM_SEND_ERROR = "telegram_send_error"
+EV_WEBHOOK_ERROR = "webhook_error"
 
 FUNNEL_EVENTS = (
     (EV_START, "/start"),

@@ -12,7 +12,14 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from .bot import build_settings_bot
 from .config import ConfigError, Settings
 from .db import ListingStore
-from .service import build_search_url, classify_check_error, fetch_listings, run_check
+from .service import (
+    build_search_url,
+    classify_check_error,
+    fetch_listings,
+    run_check,
+    run_monitoring,
+)
+from .webhook import run_webhook_server
 
 
 def configure_logging(verbose: bool = False, log_level: str | None = None) -> None:
@@ -47,6 +54,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--init-db", action="store_true", help="Create SQLite schema and exit.")
     parser.add_argument("--parser-smoke", action="store_true", help="Check parser and exit.")
     parser.add_argument("--healthcheck", action="store_true", help="Check DB health and exit.")
+    parser.add_argument("--webhook-server", action="store_true", help="Run webhook HTTP server.")
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging.")
     args = parser.parse_args(argv)
     exclusive_modes = [
@@ -56,11 +64,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.init_db,
         args.parser_smoke,
         args.healthcheck,
+        args.webhook_server,
     ]
     if sum(bool(mode) for mode in exclusive_modes) > 1:
         parser.error(
             "--once, --bot-only, --worker-only, --init-db, --parser-smoke "
-            "and --healthcheck are mutually exclusive"
+            "--healthcheck and --webhook-server are mutually exclusive"
         )
     return args
 
@@ -82,6 +91,9 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.healthcheck:
             return run_healthcheck(settings)
+
+        if args.webhook_server:
+            return run_webhook_server(settings)
 
         if args.once:
             count = run_check(settings, allow_global_fallback=True)
@@ -167,9 +179,19 @@ def start_scheduler(settings: Settings) -> BackgroundScheduler:
         max_instances=1,
         coalesce=True,
     )
+    scheduler.add_job(
+        run_monitoring,
+        "interval",
+        seconds=settings.monitoring_interval_seconds,
+        args=[settings],
+        id="monitoring",
+        max_instances=1,
+        coalesce=True,
+    )
 
     logging.info("Starting scheduler, interval=%ss", settings.check_interval_seconds)
     run_check(settings)
+    run_monitoring(settings)
     scheduler.start()
     return scheduler
 

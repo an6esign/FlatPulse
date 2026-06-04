@@ -12,7 +12,7 @@ from cian_rent_alerts.bot import (
 )
 from cian_rent_alerts.config import Settings
 from cian_rent_alerts.db import ListingStore
-from cian_rent_alerts.analytics import EV_MANUAL_CHECK, EV_TRIAL_STARTED
+from cian_rent_alerts.analytics import EV_MANUAL_CHECK, EV_TRIAL_STARTED, EV_WEBHOOK_ERROR
 
 
 def test_store_last_check_run(tmp_path: Path) -> None:
@@ -203,6 +203,7 @@ def test_format_admin_metrics(tmp_path: Path) -> None:
     )
     store.record_event(EV_MANUAL_CHECK, user_id=user_id, search_id=search_id)
     store.record_event(EV_TRIAL_STARTED, user_id=user_id, search_id=search_id)
+    store.record_event(EV_WEBHOOK_ERROR, metadata={"reason": "bad_request"})
 
     text = _format_admin_metrics(store)
 
@@ -211,6 +212,7 @@ def test_format_admin_metrics(tmp_path: Path) -> None:
     assert "searches_active: 1" in text
     assert "trial_started: 1" in text
     assert "manual_checks: 1" in text
+    assert "webhook_errors: 1" in text
     assert "listings_found: 12" in text
     assert "new_listings_sent: 3" in text
     assert "groups: active=2 unique=1 fetches=1 shared=1" in text

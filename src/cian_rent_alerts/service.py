@@ -4,6 +4,7 @@ import logging
 import threading
 import time
 import hashlib
+import json
 from dataclasses import dataclass
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
@@ -13,7 +14,13 @@ import requests
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import TelegramError
 
-from .analytics import EV_TRIAL_EXPIRED, event_for_error_type
+from .analytics import (
+    EV_CAPTCHA_ERROR,
+    EV_TELEGRAM_SEND_ERROR,
+    EV_TRIAL_EXPIRED,
+    EV_WEBHOOK_ERROR,
+    event_for_error_type,
+)
 from .cian_url import build_cian_search_url
 from .config import ConfigError, Settings
 from .db import ListingStore
@@ -33,6 +40,7 @@ logger = logging.getLogger(__name__)
 _CHECK_LOCK = threading.Lock()
 _NO_NEW_LISTINGS_NUDGE_AFTER = timedelta(hours=24)
 _PAYMENT_REQUIRED_NOTICE_COOLDOWN = timedelta(hours=24)
+_MONITORING_ALERT_STATE_KEY = "monitoring:last_alert"
 
 
 class CheckAlreadyRunning(RuntimeError):
@@ -223,6 +231,108 @@ def run_check_result(
         )
     finally:
         _CHECK_LOCK.release()
+
+
+def run_monitoring(settings: Settings) -> None:
+    if settings.dry_run or not settings.telegram_bot_token or not settings.admin_telegram_ids:
+        return
+
+    store = ListingStore(settings.database_path, settings.database_url)
+    store.init()
+    problems = _monitoring_problems(store, settings)
+    if not problems:
+        store.delete_runtime_setting(_MONITORING_ALERT_STATE_KEY)
+        return
+    if not _should_send_monitoring_alert(store, settings, problems):
+        return
+
+    text = "\n".join(["FlatPulse: мониторинг", *[f"- {problem}" for problem in problems]])
+    for chat_id in settings.admin_telegram_ids:
+        try:
+            notifier = TelegramNotifier(settings.telegram_bot_token or "", chat_id=chat_id)
+            send_message_sync(notifier, text)
+        except Exception:
+            logger.exception("Failed to send monitoring alert to chat_id=%s", chat_id)
+
+
+def _monitoring_problems(store: ListingStore, settings: Settings) -> list[str]:
+    problems: list[str] = []
+    active_searches = store.searches_count_by_status(active=True)
+    if active_searches > 0:
+        last_success = store.last_successful_check_run()
+        max_age = timedelta(minutes=settings.monitoring_max_success_age_minutes)
+        if last_success is None:
+            problems.append("нет успешных проверок при активных поисках")
+        else:
+            finished_at = _parse_state_datetime(
+                str(last_success.get("finished_at") or last_success.get("started_at") or "")
+            )
+            if finished_at is None or datetime.now(UTC) - finished_at > max_age:
+                problems.append(
+                    "последняя успешная проверка старше "
+                    f"{settings.monitoring_max_success_age_minutes} мин"
+                )
+
+    since = (datetime.now(UTC) - timedelta(hours=24)).isoformat(timespec="seconds")
+    events = store.analytics_events_summary_since(since)
+    captcha_errors = events.get(EV_CAPTCHA_ERROR, 0)
+    telegram_errors = events.get(EV_TELEGRAM_SEND_ERROR, 0)
+    webhook_errors = events.get(EV_WEBHOOK_ERROR, 0)
+
+    if (
+        settings.monitoring_captcha_error_threshold > 0
+        and captcha_errors >= settings.monitoring_captcha_error_threshold
+    ):
+        problems.append(f"captcha_errors за 24ч: {captcha_errors}")
+    if (
+        settings.monitoring_telegram_error_threshold > 0
+        and telegram_errors >= settings.monitoring_telegram_error_threshold
+    ):
+        problems.append(f"telegram_send_errors за 24ч: {telegram_errors}")
+    if (
+        settings.monitoring_webhook_error_threshold > 0
+        and webhook_errors >= settings.monitoring_webhook_error_threshold
+    ):
+        problems.append(f"webhook_errors за 24ч: {webhook_errors}")
+
+    return problems
+
+
+def _should_send_monitoring_alert(
+    store: ListingStore,
+    settings: Settings,
+    problems: list[str],
+) -> bool:
+    now = datetime.now(UTC)
+    signature = hashlib.sha256("\n".join(problems).encode("utf-8")).hexdigest()
+    raw_state = store.get_runtime_settings().get(_MONITORING_ALERT_STATE_KEY)
+    if raw_state:
+        try:
+            state = json.loads(raw_state)
+            last_signature = str(state.get("signature") or "")
+            last_sent_at = _parse_state_datetime(str(state.get("sent_at") or ""))
+        except Exception:
+            last_signature = ""
+            last_sent_at = None
+        if (
+            last_signature == signature
+            and last_sent_at is not None
+            and now - last_sent_at < timedelta(seconds=settings.monitoring_alert_cooldown_seconds)
+        ):
+            return False
+
+    store.set_runtime_setting(
+        _MONITORING_ALERT_STATE_KEY,
+        json.dumps(
+            {
+                "signature": signature,
+                "sent_at": now.isoformat(timespec="seconds"),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        ),
+    )
+    return True
 
 
 def _run_check(
@@ -436,6 +546,11 @@ def _run_check(
                     )
                     if sent_ids:
                         _remember_search_activity_checkpoint(store, search)
+                        _delay_after_telegram_send(
+                            search_settings,
+                            sent_count=len(sent_ids),
+                            only_chat_id=only_chat_id,
+                        )
                 except Exception as exc:
                     error_type = classify_check_error(exc)
                     _record_check_error_event(
@@ -661,6 +776,24 @@ def _delay_between_searches(
     time.sleep(settings.search_check_delay_seconds)
 
 
+def _delay_after_telegram_send(
+    settings: Settings,
+    *,
+    sent_count: int,
+    only_chat_id: str | None,
+) -> None:
+    if only_chat_id is not None:
+        return
+    if sent_count <= 0 or settings.telegram_send_delay_seconds <= 0:
+        return
+
+    logger.info(
+        "Waiting %s seconds after Telegram send batch",
+        settings.telegram_send_delay_seconds,
+    )
+    time.sleep(settings.telegram_send_delay_seconds)
+
+
 def _notify_admins_about_check_problem(
     settings: Settings,
     *,
@@ -803,6 +936,9 @@ def _maybe_record_trial_expired(store: ListingStore, search: Mapping[str, object
     search_id = int(search["id"])
     user = store.get_user(user_id)
     if user is None or not user.get("trial_started_at"):
+        return
+    trial_ends_at = _parse_state_datetime(str(user.get("trial_ends_at") or ""))
+    if trial_ends_at is None or trial_ends_at > datetime.now(UTC):
         return
     if store.user_has_active_access(user_id):
         return

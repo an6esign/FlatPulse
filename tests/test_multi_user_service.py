@@ -714,6 +714,38 @@ def test_expired_trial_event_is_recorded_once(tmp_path: Path, monkeypatch) -> No
     assert store.search_seen_count(search_id) == 1
 
 
+def test_active_trial_does_not_record_expired_event(tmp_path: Path, monkeypatch) -> None:
+    settings = replace(
+        Settings.from_env(env_file=None),
+        database_path=tmp_path / "test.sqlite3",
+        dry_run=True,
+    )
+    store = ListingStore(settings.database_path)
+    store.init()
+    user_id = store.upsert_user(telegram_chat_id="100")
+    search_id = store.create_search(
+        user_id=user_id,
+        title="Основной поиск",
+        city="Москва",
+        region_id="1",
+        rooms=("all",),
+        min_price=None,
+        max_price=None,
+        rent_type="all",
+        sort_by="creation_date_from_newer_to_older",
+    )
+    store.start_trial_if_needed(user_id, days=7)
+
+    monkeypatch.setattr(service, "build_scraper", lambda _settings: object())
+    monkeypatch.setattr(service, "scrape", lambda _scraper, _limit: [_listing("1")])
+
+    assert service.run_check(settings) == 0
+
+    summary = store.analytics_events_summary_since("2000-01-01T00:00:00+00:00")
+    assert summary.get(EV_TRIAL_EXPIRED, 0) == 0
+    assert store.search_seen_count(search_id) == 1
+
+
 def test_successful_search_clears_previous_cooldown(tmp_path: Path, monkeypatch) -> None:
     settings = replace(
         Settings.from_env(env_file=None),

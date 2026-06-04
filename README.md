@@ -85,7 +85,9 @@ cian-rent-alerts
 По умолчанию проверка идет каждые 10 минут. Интервал задается через
 `CHECK_INTERVAL_SECONDS`. Между проверками разных пользовательских поисков worker
 делает паузу `SEARCH_CHECK_DELAY_SECONDS`, чтобы не отправлять много запросов к
-ЦИАН подряд.
+ЦИАН подряд. После отправки пакета объявлений пользователю worker делает паузу
+`TELEGRAM_SEND_DELAY_SECONDS`, чтобы не упираться в лимиты Telegram при массовых
+рассылках.
 
 Уровень логирования задается через `LOG_LEVEL`. По умолчанию используется `INFO`,
 для подробной диагностики можно поставить `DEBUG` или запустить CLI с `--verbose`.
@@ -230,6 +232,24 @@ PARSER_DEBUG_DIR=data/debug_pages
 
 В Docker эти файлы хранятся в volume `debug_pages`. Они помогают понять, что именно вернул ЦИАН: капчу, пустую выдачу или измененную разметку.
 
+## Мониторинг
+
+Worker регулярно проверяет бизнес-состояние системы и отправляет админам alert,
+если при активных поисках давно не было успешной проверки или накопились ошибки.
+
+```env
+MONITORING_INTERVAL_SECONDS=600
+MONITORING_MAX_SUCCESS_AGE_MINUTES=30
+MONITORING_ALERT_COOLDOWN_SECONDS=3600
+MONITORING_CAPTCHA_ERROR_THRESHOLD=5
+MONITORING_TELEGRAM_ERROR_THRESHOLD=3
+MONITORING_WEBHOOK_ERROR_THRESHOLD=1
+TELEGRAM_SEND_DELAY_SECONDS=1
+```
+
+Alert уходит только в `ADMIN_TELEGRAM_IDS`. Повтор одинаковой проблемы не
+отправляется чаще, чем `MONITORING_ALERT_COOLDOWN_SECONDS`.
+
 ## База данных
 
 В продовом Docker Compose используется PostgreSQL:
@@ -289,6 +309,8 @@ ADMIN_TELEGRAM_IDS=...
 POSTGRES_DB=flatpulse
 POSTGRES_USER=flatpulse
 POSTGRES_PASSWORD=...
+YOOKASSA_WEBHOOK_SECRET=replace_with_long_random_secret
+WEBHOOK_DOMAIN=:80
 ```
 
 `docker-compose.yml` не хранит пароль Postgres и собирает `DATABASE_URL` из этих переменных. Сам файл `.env` не должен попадать в git или Docker build context.
@@ -298,14 +320,16 @@ PostgreSQL-данные хранятся в Docker volume `postgres_data`. В Do
 - `migrate` - применяет Alembic-миграции и завершается;
 - `bot` - слушает Telegram polling;
 - `worker` - выполняет проверки по расписанию.
+- `webhook` - принимает YooKassa webhook для автоматического подтверждения оплат.
+- `caddy` - принимает внешний HTTP/HTTPS-трафик и проксирует YooKassa webhook внутрь.
 
-`bot` и `worker` стартуют только после успешного завершения `migrate` и используют одну PostgreSQL-базу.
-Для `bot` и `worker` настроен Docker healthcheck через `cian-rent-alerts --healthcheck`.
+`bot`, `worker` и `webhook` стартуют только после успешного завершения `migrate` и используют одну PostgreSQL-базу.
+Для них настроен Docker healthcheck через `cian-rent-alerts --healthcheck`.
 
 Посмотреть логи:
 
 ```bash
-docker compose logs -f migrate bot worker
+docker compose logs -f migrate bot worker webhook caddy
 ```
 
 ## Local Dev Bot
@@ -412,12 +436,10 @@ docker compose run --rm worker cian-rent-alerts --parser-smoke
 Обновить сервер с GitHub:
 
 ```bash
-git pull
-docker compose build bot worker migrate
-docker compose run --rm migrate
-docker compose up -d bot worker
-docker compose ps
+sh deploy/update.sh
 ```
+
+`deploy/update.sh` перед обновлением делает PostgreSQL backup, сохраняет предыдущий commit в `.flatpulse_previous_commit`, применяет миграции, запускает `bot`, `worker`, `webhook`, `caddy` и выполняет healthcheck.
 
 Если `bot` пишет `telegram.error.Conflict`, значит где-то запущен второй экземпляр
 Telegram polling с тем же токеном. Остановите лишний процесс или контейнер, затем
@@ -472,7 +494,7 @@ git, backup-архивы или публичные логи.
 ```bash
 docker compose config --quiet
 docker compose run --rm migrate
-docker compose up -d bot worker
+docker compose up -d bot worker webhook caddy
 docker compose ps
 ```
 
@@ -533,13 +555,13 @@ docker compose run --rm bot cian-rent-alerts --healthcheck
 5. Запустите сервисы:
 
 ```bash
-docker compose up -d bot worker
+docker compose up -d bot worker webhook caddy
 ```
 
 6. Проверьте логи старта:
 
 ```bash
-docker compose logs -f --tail=100 bot worker
+docker compose logs -f --tail=100 bot worker webhook caddy
 ```
 
 7. В Telegram от админского аккаунта проверьте:
@@ -552,12 +574,52 @@ docker compose logs -f --tail=100 bot worker
 Ожидаемо: `DB: ok`, актуальная schema version, worker без постоянных `captcha`,
 `empty_parse` или `network` ошибок.
 
+## YooKassa Webhook
+
+Для автоматического подтверждения оплат запустите сервисы `webhook` и `caddy`, затем укажите в YooKassa webhook URL:
+
+```text
+https://YOUR_DOMAIN/webhooks/yookassa/YOOKASSA_WEBHOOK_SECRET
+```
+
+Секрет должен быть длинным случайным значением из `.env`:
+
+```env
+YOOKASSA_WEBHOOK_SECRET=replace_with_long_random_secret
+WEBHOOK_PORT=8080
+WEBHOOK_DOMAIN=YOUR_DOMAIN
+```
+
+Пока домена нет, можно временно проверить доступность webhook через IP по HTTP:
+
+```env
+WEBHOOK_DOMAIN=:80
+```
+
+Тогда внешний URL будет таким:
+
+```text
+http://SERVER_IP/webhooks/yookassa/YOOKASSA_WEBHOOK_SECRET
+```
+
+Для стабильной работы с YooKassa лучше подключить домен и HTTPS. Домен нужен, потому что нормальный публичный TLS-сертификат обычно выпускается на доменное имя, а не на сырой IP VPS. Когда `WEBHOOK_DOMAIN` будет равен домену, Caddy автоматически получит HTTPS-сертификат Let’s Encrypt и начнет принимать webhook по `https://...`.
+
+YooKassa должна отправлять событие `payment.succeeded`. Когда webhook приходит:
+
+- платеж находится по YooKassa `object.id`;
+- платеж помечается как `succeeded`;
+- пользователю выдается подписка на `SUBSCRIPTION_PERIOD_DAYS`;
+- текущий поиск включается;
+- пользователю отправляется сообщение о подтверждении оплаты.
+
+Если webhook пришел повторно, подписка не продлевается второй раз: платеж с уже заполненным `paid_until` считается обработанным.
+
 ## Backup и Restore
 
 Создать backup PostgreSQL:
 
 ```bash
-docker compose --profile ops run --rm backup
+sh deploy/backup.sh
 ```
 
 Backup сохраняется в Docker volume `backups` как файл вида `flatpulse_YYYYmmdd_HHMMSS.dump`.
@@ -571,12 +633,32 @@ docker compose --profile ops run --rm backup sh -c 'ls -lh /backups'
 Восстановить backup:
 
 ```bash
-docker compose stop bot worker
-BACKUP_FILE=flatpulse_YYYYmmdd_HHMMSS.dump docker compose --profile ops run --rm restore
-docker compose up -d bot worker
+BACKUP_FILE=flatpulse_YYYYmmdd_HHMMSS.dump sh deploy/restore.sh
 ```
 
 Restore выполняет `pg_restore --clean --if-exists`: текущие таблицы будут перезаписаны данными из backup. Перед восстановлением убедитесь, что выбран правильный файл.
+
+## Rollback
+
+Откат к предыдущему commit, сохраненному последним `deploy/update.sh`:
+
+```bash
+sh deploy/rollback.sh
+```
+
+Откат к конкретному commit:
+
+```bash
+sh deploy/rollback.sh 97aa4c8
+```
+
+Если нужно откатить не только код, но и состояние БД:
+
+```bash
+RESTORE_BACKUP_FILE=flatpulse_YYYYmmdd_HHMMSS.dump sh deploy/rollback.sh 97aa4c8
+```
+
+Миграции назад автоматически не откатываются. Для серьезного rollback после несовместимой миграции используйте restore backup.
 
 ## Важные замечания
 

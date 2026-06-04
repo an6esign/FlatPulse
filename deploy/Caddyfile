@@ -1,0 +1,7 @@
+{$WEBHOOK_DOMAIN} {
+	handle /webhooks/yookassa/* {
+		reverse_proxy webhook:{$WEBHOOK_PORT}
+	}
+
+	respond "Not found" 404
+}

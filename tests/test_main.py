@@ -40,9 +40,16 @@ def test_parse_healthcheck_mode() -> None:
     assert args.once is False
 
 
+def test_parse_webhook_server_mode() -> None:
+    args = parse_args(["--webhook-server"])
+
+    assert args.webhook_server is True
+    assert args.once is False
+
+
 def test_parse_rejects_multiple_modes() -> None:
     with pytest.raises(SystemExit):
-        parse_args(["--worker-only", "--healthcheck"])
+        parse_args(["--worker-only", "--webhook-server"])
 
 
 def test_parse_log_level_accepts_known_levels() -> None:

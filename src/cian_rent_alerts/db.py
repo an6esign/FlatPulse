@@ -355,6 +355,16 @@ class ListingStore:
             ).first()
         return dict(row._mapping) if row is not None else None
 
+    def last_successful_check_run(self) -> dict[str, object] | None:
+        with self.engine.begin() as conn:
+            row = conn.execute(
+                select(check_runs_table)
+                .where(check_runs_table.c.status == "success")
+                .order_by(check_runs_table.c.finished_at.desc(), check_runs_table.c.started_at.desc())
+                .limit(1)
+            ).first()
+        return dict(row._mapping) if row is not None else None
+
     def get_check_run(self, run_id: int) -> dict[str, object] | None:
         with self.engine.begin() as conn:
             row = conn.execute(
@@ -659,6 +669,18 @@ class ListingStore:
                 .where(payments_table.c.provider_payment_id == provider_payment_id)
                 .values(**values)
             )
+
+    def payment_by_provider_payment_id(
+        self,
+        provider_payment_id: str,
+    ) -> dict[str, object] | None:
+        with self.engine.begin() as conn:
+            row = conn.execute(
+                select(payments_table).where(
+                    payments_table.c.provider_payment_id == provider_payment_id
+                )
+            ).first()
+        return dict(row._mapping) if row is not None else None
 
     def latest_pending_payment_for_user(self, user_id: int) -> dict[str, object] | None:
         with self.engine.begin() as conn:

@@ -98,6 +98,7 @@ class Settings:
     parser_debug_dir: Path | None
     check_interval_seconds: int
     search_check_delay_seconds: int
+    telegram_send_delay_seconds: int
     listing_limit: int
     listing_max_age_days: int
     dry_run: bool
@@ -115,6 +116,15 @@ class Settings:
     yookassa_shop_id: str | None
     yookassa_secret_key: str | None
     yookassa_return_url: str | None
+    yookassa_webhook_secret: str | None
+    webhook_host: str
+    webhook_port: int
+    monitoring_interval_seconds: int
+    monitoring_max_success_age_minutes: int
+    monitoring_alert_cooldown_seconds: int
+    monitoring_captcha_error_threshold: int
+    monitoring_telegram_error_threshold: int
+    monitoring_webhook_error_threshold: int
     subscription_price_rub: int
     subscription_period_days: int
     trial_days: int
@@ -146,6 +156,7 @@ class Settings:
             parser_debug_dir=_as_optional_path(os.getenv("PARSER_DEBUG_DIR")),
             check_interval_seconds=max(_as_int("CHECK_INTERVAL_SECONDS", 600), 60),
             search_check_delay_seconds=max(_as_int("SEARCH_CHECK_DELAY_SECONDS", 5), 0),
+            telegram_send_delay_seconds=max(_as_int("TELEGRAM_SEND_DELAY_SECONDS", 1), 0),
             listing_limit=max(_as_int("LISTING_LIMIT", 50), 1),
             listing_max_age_days=max(_as_int("LISTING_MAX_AGE_DAYS", 2), 0),
             dry_run=_as_bool(os.getenv("DRY_RUN"), False),
@@ -169,6 +180,25 @@ class Settings:
             yookassa_shop_id=os.getenv("YOOKASSA_SHOP_ID") or None,
             yookassa_secret_key=os.getenv("YOOKASSA_SECRET_KEY") or None,
             yookassa_return_url=os.getenv("YOOKASSA_RETURN_URL") or None,
+            yookassa_webhook_secret=os.getenv("YOOKASSA_WEBHOOK_SECRET") or None,
+            webhook_host=os.getenv("WEBHOOK_HOST", "0.0.0.0").strip(),
+            webhook_port=max(_as_int("WEBHOOK_PORT", 8080), 1),
+            monitoring_interval_seconds=max(_as_int("MONITORING_INTERVAL_SECONDS", 600), 60),
+            monitoring_max_success_age_minutes=max(
+                _as_int("MONITORING_MAX_SUCCESS_AGE_MINUTES", 30), 1
+            ),
+            monitoring_alert_cooldown_seconds=max(
+                _as_int("MONITORING_ALERT_COOLDOWN_SECONDS", 3600), 60
+            ),
+            monitoring_captcha_error_threshold=max(
+                _as_int("MONITORING_CAPTCHA_ERROR_THRESHOLD", 5), 0
+            ),
+            monitoring_telegram_error_threshold=max(
+                _as_int("MONITORING_TELEGRAM_ERROR_THRESHOLD", 3), 0
+            ),
+            monitoring_webhook_error_threshold=max(
+                _as_int("MONITORING_WEBHOOK_ERROR_THRESHOLD", 1), 0
+            ),
             subscription_price_rub=max(_as_int("SUBSCRIPTION_PRICE_RUB", 199), 1),
             subscription_period_days=max(_as_int("SUBSCRIPTION_PERIOD_DAYS", 31), 1),
             trial_days=max(_as_int("TRIAL_DAYS", 7), 0),

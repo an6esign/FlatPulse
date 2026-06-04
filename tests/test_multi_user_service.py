@@ -710,8 +710,12 @@ def test_expired_trial_event_is_recorded_once(tmp_path: Path, monkeypatch) -> No
     assert service.run_check(settings) == 0
 
     summary = store.analytics_events_summary_since("2000-01-01T00:00:00+00:00")
+    search = store.current_search_for_user(user_id)
     assert summary[EV_TRIAL_EXPIRED] == 1
-    assert store.search_seen_count(search_id) == 1
+    assert search is not None
+    assert search["is_active"] is False
+    assert search["initialized_at"] is None
+    assert store.search_seen_count(search_id) == 0
 
 
 def test_active_trial_does_not_record_expired_event(tmp_path: Path, monkeypatch) -> None:
@@ -1072,7 +1076,7 @@ def test_expired_access_blocks_notifications_without_marking_seen(
     assert store.search_seen_count(search_id) == 1
     assert len(sent_messages) == 1
     text, reply_markup = sent_messages[0]
-    assert "Пробный период закончился" in text
+    assert "Доступ к уведомлениям закончился" in text
     assert reply_markup.inline_keyboard[0][0].callback_data == "cfg:subscribe"
 
 

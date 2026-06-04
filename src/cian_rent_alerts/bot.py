@@ -56,6 +56,7 @@ from .config import ConfigError, Settings
 from .db import ListingStore
 from .geo import build_radius_polygon, geocode_address
 from .notifier import TelegramNotifier, send_listings_sync
+from .payment_texts import payment_success_text
 from .service import CheckAlreadyRunning, build_search_url, run_check_result, settings_with_search
 
 logger = logging.getLogger(__name__)
@@ -149,6 +150,9 @@ class SettingsBot:
             CommandHandler("admin_metrics", self._admin_only(self.admin_metrics))
         )
         application.add_handler(
+            CommandHandler("admin_payments", self._admin_only(self.admin_payments))
+        )
+        application.add_handler(
             CommandHandler("dev_payment_screen", self._admin_only(self.dev_payment_screen))
         )
         application.add_handler(
@@ -194,19 +198,28 @@ class SettingsBot:
         search = self._current_search(update)
         if search is None:
             return "💳 Подписка не активна"
-        if not search["is_active"]:
-            return "⏸ Уведомления остановлены"
 
         user = self.store.get_user(int(search["user_id"]))
         if user is None:
             return "💳 Подписка не активна"
+        user_id = int(user["id"])
         if user.get("is_admin"):
+            if not search["is_active"]:
+                return "⏸ Уведомления остановлены"
             return "👑 Админ-доступ активен"
-        if self.store.user_has_active_paid_access(int(user["id"])):
+        if self.store.user_has_active_paid_access(user_id):
+            if not search["is_active"]:
+                return "⏸ Уведомления остановлены"
             return f"💎 Подписка активна до {_format_timestamp(user.get('paid_until'))}"
-        if self.store.user_has_active_trial(int(user["id"])):
+        if self.store.user_has_active_trial(user_id):
+            if not search["is_active"]:
+                return "⏸ Уведомления остановлены"
             return f"🎁 Пробный период активен до {_format_timestamp(user.get('trial_ends_at'))}"
-        if self.store.user_has_used_trial(int(user["id"])):
+        if self.store.latest_pending_payment_for_user(user_id) is not None:
+            return "💳 Ожидает оплаты"
+        if user.get("paid_until"):
+            return "⏳ Подписка закончилась"
+        if self.store.user_has_used_trial(user_id):
             return "⏳ Пробный период закончился"
         return "💳 Подписка не активна"
 
@@ -812,6 +825,9 @@ class SettingsBot:
     async def admin_metrics(self, update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
         await _reply(update, _format_admin_metrics(self.store))
 
+    async def admin_payments(self, update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+        await _reply(update, _format_admin_payments(self.store.recent_payments()))
+
     async def dev_payment_screen(self, update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
         if self.settings.environment != "dev":
             return
@@ -1382,6 +1398,9 @@ class SettingsBot:
                 user_id,
                 days=self.settings.subscription_period_days,
             )
+            search = self.store.current_search_for_user(user_id)
+            if search is not None:
+                self.store.update_search(int(search["id"]), is_active=True, initialized_at=None)
         self.store.update_payment(
             payment.provider_payment_id,
             status=payment.status,
@@ -1392,9 +1411,7 @@ class SettingsBot:
             self._record_event(EV_PAYMENT_SUCCEEDED, update)
             await _respond(
                 update,
-                "✅ Оплата прошла.\n\n"
-                f"Подписка активна до {_format_timestamp(paid_until)}. "
-                "Новые квартиры будут приходить автоматически.",
+                payment_success_text(_format_timestamp(paid_until)),
                 _main_keyboard(),
             )
             return
@@ -2030,7 +2047,7 @@ def _trial_used_text(settings: Settings) -> str:
 def _payment_required_text(settings: Settings) -> str:
     return "\n".join(
         [
-            "⏳ Пробный период закончился.",
+            "⏳ Доступ к уведомлениям закончился.",
             "",
             "FlatPulse уже знает ваши параметры поиска, но новые уведомления сейчас на паузе.",
             "",
@@ -2350,12 +2367,31 @@ def _format_admin_searches(searches: list[dict[str, object]]) -> str:
     return "\n".join(lines)
 
 
+def _format_admin_payments(payments: list[dict[str, object]]) -> str:
+    if not payments:
+        return "Admin payments\nНет платежей"
+
+    lines = ["Admin payments"]
+    for payment in payments:
+        username = payment.get("username") or "-"
+        lines.append(
+            f"#{payment['id']} user={payment['user_id']} "
+            f"chat={payment.get('telegram_chat_id') or '-'} @{username} "
+            f"pay={_short_provider_payment_id(payment.get('provider_payment_id'))} "
+            f"status={payment['status']} amount={payment['amount_rub']} ₽ "
+            f"created={_format_timestamp(payment.get('created_at'))} "
+            f"paid_until={_format_timestamp(payment.get('paid_until'))}"
+        )
+    return "\n".join(lines)
+
+
 def _format_admin_report(store: ListingStore, settings: Settings) -> str:
     return "\n\n".join(
         [
             _format_admin_health(store, settings),
             _format_admin_status(store, settings),
             _format_admin_searches(store.recent_searches(limit=3)),
+            _format_admin_payments(store.recent_payments(limit=3)),
             _format_check_runs("Последние проверки", store.recent_check_runs(limit=3)),
             _format_check_runs("Последние ошибки", store.recent_failed_check_runs(limit=3)),
         ]
@@ -2376,6 +2412,13 @@ def _active_cooldown_until(search: dict[str, object]) -> str | None:
     if cooldown_at <= datetime.now(UTC):
         return None
     return value
+
+
+def _short_provider_payment_id(value: object) -> str:
+    raw_value = str(value or "")
+    if not raw_value:
+        return "-"
+    return f"...{raw_value[-6:]}"
 
 
 def _format_check_runs(title: str, runs: list[dict[str, object]]) -> str:

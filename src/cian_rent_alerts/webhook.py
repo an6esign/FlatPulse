@@ -11,6 +11,7 @@ from .analytics import EV_PAYMENT_SUCCEEDED, EV_WEBHOOK_ERROR
 from .config import ConfigError, Settings
 from .db import ListingStore
 from .notifier import TelegramNotifier, send_message_sync
+from .payment_texts import payment_success_text
 
 logger = logging.getLogger(__name__)
 
@@ -104,7 +105,7 @@ def process_yookassa_webhook(
     )
     search = store.current_search_for_user(user_id)
     if search is not None:
-        store.update_search(int(search["id"]), is_active=True)
+        store.update_search(int(search["id"]), is_active=True, initialized_at=None)
         search_id = int(search["id"])
     else:
         search_id = None
@@ -131,14 +132,7 @@ def _notify_user_about_payment(
     if user is None:
         return
     chat_id = str(user["telegram_chat_id"])
-    text = "\n".join(
-        [
-            "✅ Оплата прошла.",
-            "",
-            f"Подписка активна до {paid_until or '-'}.",
-            "Новые квартиры будут приходить автоматически.",
-        ]
-    )
+    text = payment_success_text(paid_until)
     try:
         notifier = TelegramNotifier(settings.telegram_bot_token or "", chat_id=chat_id)
         send_message_sync(notifier, text)

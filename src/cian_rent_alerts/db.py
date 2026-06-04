@@ -360,7 +360,9 @@ class ListingStore:
             row = conn.execute(
                 select(check_runs_table)
                 .where(check_runs_table.c.status == "success")
-                .order_by(check_runs_table.c.finished_at.desc(), check_runs_table.c.started_at.desc())
+                .order_by(
+                    check_runs_table.c.finished_at.desc(), check_runs_table.c.started_at.desc()
+                )
                 .limit(1)
             ).first()
         return dict(row._mapping) if row is not None else None
@@ -692,6 +694,28 @@ class ListingStore:
                 .limit(1)
             ).first()
         return dict(row._mapping) if row is not None else None
+
+    def recent_payments(self, limit: int = 10) -> list[dict[str, object]]:
+        with self.engine.begin() as conn:
+            rows = conn.execute(
+                select(
+                    payments_table.c.id,
+                    payments_table.c.user_id,
+                    payments_table.c.provider,
+                    payments_table.c.provider_payment_id,
+                    payments_table.c.status,
+                    payments_table.c.amount_rub,
+                    payments_table.c.paid_until,
+                    payments_table.c.created_at,
+                    payments_table.c.updated_at,
+                    users_table.c.telegram_chat_id,
+                    users_table.c.username,
+                )
+                .join(users_table, users_table.c.id == payments_table.c.user_id)
+                .order_by(payments_table.c.created_at.desc(), payments_table.c.id.desc())
+                .limit(limit)
+            ).fetchall()
+        return [dict(row._mapping) for row in rows]
 
     def users_count(self, *, active: bool | None = None) -> int:
         query = select(func.count()).select_from(users_table)

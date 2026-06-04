@@ -485,6 +485,9 @@ def _run_check(
                     listings_found += len(listings)
                     store.record_search_success(search_id, initialize=not was_initialized)
                     _maybe_record_trial_expired(store, search)
+                    if _sync_search_access_status(store, search):
+                        _maybe_notify_payment_required(store, search_settings, search)
+                        continue
                     logger.info(
                         "Applied %s listings for search_id=%s chat_id=%s",
                         len(listings),
@@ -949,6 +952,20 @@ def _maybe_record_trial_expired(store: ListingStore, search: Mapping[str, object
     store.set_user_state(user_id, state_key, datetime.now(UTC).isoformat(timespec="seconds"))
 
 
+def _sync_search_access_status(store: ListingStore, search: Mapping[str, object]) -> bool:
+    user_id = int(search["user_id"])
+    search_id = int(search["id"])
+    user = store.get_user(user_id)
+    if user is None:
+        return False
+    if store.user_has_active_access(user_id):
+        return False
+    if not user.get("trial_started_at") and not user.get("paid_until"):
+        return False
+    store.update_search(search_id, is_active=False, initialized_at=None)
+    return True
+
+
 def _last_new_listing_state_key(search_id: int) -> str:
     return f"last_new_listing_at:{search_id}"
 
@@ -998,7 +1015,7 @@ def _no_new_listings_nudge_keyboard() -> InlineKeyboardMarkup:
 def _payment_required_text(settings: Settings) -> str:
     return "\n".join(
         [
-            "⏳ Пробный период закончился.",
+            "⏳ Доступ к уведомлениям закончился.",
             "",
             "FlatPulse уже знает ваши параметры поиска, но новые уведомления сейчас на паузе.",
             "",

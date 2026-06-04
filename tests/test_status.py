@@ -4,6 +4,7 @@ from dataclasses import replace
 from cian_rent_alerts.bot import (
     _format_admin_health,
     _format_admin_metrics,
+    _format_admin_payments,
     _format_admin_report,
     _format_admin_searches,
     _format_admin_status,
@@ -170,6 +171,7 @@ def test_admin_monitoring_counts_and_formatters(tmp_path: Path) -> None:
     assert "Admin health" in report_text
     assert "Admin status" in report_text
     assert "Admin searches" in report_text
+    assert "Admin payments" in report_text
     assert "Последние проверки" in report_text
     assert "Последние ошибки" in report_text
 
@@ -217,6 +219,38 @@ def test_format_admin_metrics(tmp_path: Path) -> None:
     assert "new_listings_sent: 3" in text
     assert "groups: active=2 unique=1 fetches=1 shared=1" in text
     assert "/start: 0" in text
+
+
+def test_format_admin_payments_redacts_provider_id(tmp_path: Path) -> None:
+    store = ListingStore(tmp_path / "test.sqlite3")
+    store.init()
+    user_id = store.upsert_user(telegram_chat_id="100", username="tester")
+    store.create_payment(
+        user_id=user_id,
+        provider_payment_id="payment-secret-123456",
+        status="pending",
+        amount_rub=199,
+        confirmation_url="https://yookassa.test/pay",
+        raw_json="{}",
+    )
+    store.update_payment(
+        "payment-secret-123456",
+        status="succeeded",
+        paid_until="2026-07-04T08:00:00+00:00",
+        raw_json="{}",
+    )
+
+    payments = store.recent_payments()
+    text = _format_admin_payments(payments)
+
+    assert len(payments) == 1
+    assert "Admin payments" in text
+    assert "chat=100" in text
+    assert "@tester" in text
+    assert "status=succeeded" in text
+    assert "amount=199 ₽" in text
+    assert "pay=...123456" in text
+    assert "payment-secret-123456" not in text
 
 
 def test_schema_version_is_unknown_without_alembic_table(tmp_path: Path) -> None:

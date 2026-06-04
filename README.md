@@ -624,6 +624,19 @@ sh deploy/backup.sh
 
 Backup сохраняется в Docker volume `backups` как файл вида `flatpulse_YYYYmmdd_HHMMSS.dump`.
 
+По умолчанию `deploy/backup.sh` хранит 30 последних backup-файлов и удаляет более
+старые файлы по маске `flatpulse_*.dump`. Лимит можно поменять:
+
+```bash
+BACKUP_RETENTION_COUNT=14 sh deploy/backup.sh
+```
+
+Если нужно временно отключить удаление старых backup:
+
+```bash
+BACKUP_RETENTION_COUNT=0 sh deploy/backup.sh
+```
+
 Посмотреть список backup-файлов:
 
 ```bash

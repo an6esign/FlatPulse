@@ -5,6 +5,8 @@ from types import SimpleNamespace
 
 from sqlalchemy import update
 
+from cian_rent_alerts import bot as bot_module
+from cian_rent_alerts.billing import PaymentStatus
 from cian_rent_alerts.bot import SettingsBot
 from cian_rent_alerts.config import Settings
 from cian_rent_alerts.db import users_table
@@ -107,3 +109,70 @@ def test_expired_trial_cannot_be_started_again_or_activate_search(tmp_path) -> N
     assert current_search is not None
     assert current_search["is_active"] is False
     assert "Бесплатный период уже был использован" in update_obj.effective_message.replies[-1][0]
+
+
+def test_pending_payment_is_visible_in_access_status(tmp_path) -> None:
+    bot = SettingsBot(_settings(tmp_path))
+    update_obj = FakeUpdate()
+    search = bot._ensure_user_search(update_obj)
+    assert search is not None
+    user_id = int(search["user_id"])
+    bot.store.create_payment(
+        user_id=user_id,
+        provider_payment_id="payment-1",
+        status="pending",
+        amount_rub=199,
+        confirmation_url="https://yookassa.test/pay",
+        raw_json="{}",
+    )
+
+    assert bot.access_status_for_update(update_obj) == "💳 Ожидает оплаты"
+
+
+def test_manual_payment_check_activates_search(tmp_path, monkeypatch) -> None:
+    settings = replace(
+        _settings(tmp_path),
+        yookassa_shop_id="shop",
+        yookassa_secret_key="secret",
+        yookassa_return_url="https://flatpulse.ru/thanks",
+    )
+    bot = SettingsBot(settings)
+    update_obj = FakeUpdate()
+    search = bot._ensure_user_search(update_obj)
+    assert search is not None
+    user_id = int(search["user_id"])
+    bot.store.update_search(
+        int(search["id"]),
+        is_active=False,
+        initialized_at=(datetime.now(UTC) - timedelta(days=1)).isoformat(timespec="seconds"),
+    )
+    bot.store.create_payment(
+        user_id=user_id,
+        provider_payment_id="payment-1",
+        status="pending",
+        amount_rub=199,
+        confirmation_url="https://yookassa.test/pay",
+        raw_json="{}",
+    )
+
+    class FakeYooKassaClient:
+        def __init__(self, _settings: Settings) -> None:
+            pass
+
+        def get_payment(self, provider_payment_id: str) -> PaymentStatus:
+            return PaymentStatus(
+                provider_payment_id=provider_payment_id,
+                status="succeeded",
+                paid=True,
+                raw_json="{}",
+            )
+
+    monkeypatch.setattr(bot_module, "YooKassaClient", FakeYooKassaClient)
+
+    asyncio.run(bot._check_subscription_payment(update_obj))
+
+    current_search = bot.store.current_search_for_user(user_id)
+    assert current_search is not None
+    assert current_search["is_active"] is True
+    assert current_search["initialized_at"] is None
+    assert "Уведомления включены" in update_obj.effective_message.replies[-1][0]

@@ -18,8 +18,8 @@ class Listing:
         if self.title:
             return self.title.strip()
         if self.rooms:
-            return f"{self.rooms}, аренда"
-        return "Квартира в аренду"
+            return self.rooms
+        return "Квартира"
 
     def format_message(self) -> str:
         lines = [self.short_title()]

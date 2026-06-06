@@ -163,6 +163,7 @@ def build_search_url(settings: Settings) -> str:
             max_price=settings.cian_max_price,
             rent_type=settings.cian_rent_type,
             sort_by=settings.cian_sort_by,
+            deal_type=settings.cian_deal_type,
             polygon=settings.cian_polygon,
         )
     if not settings.cian_search_url:
@@ -182,6 +183,7 @@ def settings_with_search(settings: Settings, search: Mapping[str, object]) -> Se
         cian_use_generated_url=_as_bool(search.get("use_generated_url")),
         cian_city=str(search["city"]),
         cian_region_id=_optional_str(search.get("region_id")),
+        cian_deal_type=str(search.get("deal_type") or "rent"),
         cian_rooms=_rooms_from_search(search.get("rooms")),
         cian_min_price=_optional_int(search.get("min_price")),
         cian_max_price=_optional_int(search.get("max_price")),

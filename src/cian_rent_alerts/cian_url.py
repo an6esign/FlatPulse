@@ -36,6 +36,7 @@ def build_cian_search_url(
     max_price: int | None,
     rent_type: str,
     sort_by: str,
+    deal_type: str = "rent",
     polygon: str | None = None,
 ) -> str:
     resolved_region_id = region_id or CIAN_LOCATION_REGION_IDS.get(city)
@@ -44,23 +45,27 @@ def build_cian_search_url(
             f"Unknown CIAN city {city!r}. Set CIAN_REGION_ID explicitly or add the city mapping."
         )
 
+    if deal_type not in {"rent", "sale"}:
+        raise ConfigError("CIAN_DEAL_TYPE must be 'rent' or 'sale'")
+
     query: list[tuple[str, str | int]] = [
         ("engine_version", "2"),
         ("p", "1"),
         ("with_neighbors", "0"),
         ("region", resolved_region_id),
-        ("deal_type", "rent"),
+        ("deal_type", deal_type),
         ("offer_type", "flat"),
     ]
 
-    if rent_type == "long":
-        query.append(("type", "4"))
-    elif rent_type == "short":
-        query.append(("type", "2"))
-    elif rent_type == "all":
-        pass
-    else:
-        raise ConfigError("CIAN_RENT_TYPE must be 'long', 'short', or 'all'")
+    if deal_type == "rent":
+        if rent_type == "long":
+            query.append(("type", "4"))
+        elif rent_type == "short":
+            query.append(("type", "2"))
+        elif rent_type == "all":
+            pass
+        else:
+            raise ConfigError("CIAN_RENT_TYPE must be 'long', 'short', or 'all'")
 
     for room in rooms:
         room = room.strip().lower()

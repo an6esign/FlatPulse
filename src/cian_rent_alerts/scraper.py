@@ -18,8 +18,8 @@ from .models import Listing
 
 logger = logging.getLogger(__name__)
 
-LISTING_URL_RE = re.compile(r"https?://(?:[\w-]+\.)?cian\.ru/rent/flat/(\d+)/?")
-RELATIVE_LISTING_URL_RE = re.compile(r"/rent/flat/(\d+)/?")
+LISTING_URL_RE = re.compile(r"https?://(?:[\w-]+\.)?cian\.ru/(rent|sale)/flat/(\d+)/?")
+RELATIVE_LISTING_URL_RE = re.compile(r"/(rent|sale)/flat/(\d+)/?")
 PRICE_RE = re.compile(r"(\d[\d\s]{2,})\s*(?:₽|руб\.?|р\b)")
 ROOMS_RE = re.compile(r"((?:\d+)-комн\.?|студия|студии)", re.IGNORECASE)
 _CAPTCHA_MESSAGE = (
@@ -280,14 +280,14 @@ def _listing_id_from_url(url: str) -> str | None:
     match = LISTING_URL_RE.search(url) or RELATIVE_LISTING_URL_RE.search(url)
     if not match:
         return None
-    return match.group(1)
+    return match.group(2)
 
 
 def _normalize_listing_url(url: str) -> str:
     absolute = urljoin("https://www.cian.ru", url)
     match = LISTING_URL_RE.search(absolute)
     if match:
-        return f"https://www.cian.ru/rent/flat/{match.group(1)}/"
+        return f"https://www.cian.ru/{match.group(1)}/flat/{match.group(2)}/"
     return absolute
 
 

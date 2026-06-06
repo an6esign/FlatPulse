@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import UTC, datetime
 
 from cian_rent_alerts.bot import (
@@ -15,10 +16,12 @@ from cian_rent_alerts.bot import (
     _initial_seed_text,
     _main_keyboard,
     _manual_check_cooldown_remaining,
+    _onboarding_price_keyboard,
     _parse_manual_city,
     _parse_manual_price,
     _parse_manual_rent,
     _parse_manual_rooms,
+    _price_keyboard,
     _remember_callback_action,
     _start_reply_keyboard,
     _stopped_search_keyboard,
@@ -90,14 +93,52 @@ def test_search_settings_keyboard_has_pause_and_delete_actions() -> None:
     keyboard = _search_settings_keyboard().inline_keyboard
 
     assert keyboard[0][0].text == "✏️ Изменить фильтры"
-    assert keyboard[1][0].text == "💎 Подписка"
-    assert keyboard[1][0].callback_data == "cfg:subscribe"
-    assert keyboard[2][0].text == "💬 Связаться с поддержкой"
-    assert keyboard[2][0].url == "https://t.me/FlatPulseSupport"
-    assert keyboard[3][0].text == "⏸ Остановить уведомления"
-    assert keyboard[3][0].callback_data == "cfg:stop"
-    assert keyboard[4][0].text == "🗑 Удалить поиск"
-    assert keyboard[4][0].callback_data == "cfg:delete"
+    assert keyboard[1][0].text == "🏠 Тип сделки"
+    assert keyboard[1][0].callback_data == "cfg:deal"
+    assert keyboard[2][0].text == "💎 Подписка"
+    assert keyboard[2][0].callback_data == "cfg:subscribe"
+    assert keyboard[3][0].text == "💬 Связаться с поддержкой"
+    assert keyboard[3][0].url == "https://t.me/FlatPulseSupport"
+    assert keyboard[4][0].text == "⏸ Остановить уведомления"
+    assert keyboard[4][0].callback_data == "cfg:stop"
+    assert keyboard[5][0].text == "🗑 Удалить поиск"
+    assert keyboard[5][0].callback_data == "cfg:delete"
+
+
+def test_rent_price_keyboard_uses_rent_ranges() -> None:
+    keyboard = _onboarding_price_keyboard("rent").inline_keyboard
+
+    assert keyboard[0][0].text == "Любая"
+    assert keyboard[0][1].text == "💸 До 30 000 ₽"
+    assert [button.text for button in keyboard[1]] == [
+        "🏠 30 000 – 60 000 ₽",
+        "✨ От 60 000 ₽",
+    ]
+    assert keyboard[2][0].text == "Ввести вручную"
+    assert [button.callback_data for button in keyboard[1]] == [
+        "onb:price:rent_30_60",
+        "onb:price:rent_from_60",
+    ]
+    assert [button.callback_data for button in keyboard[0]] == [
+        "onb:price:none",
+        "onb:price:rent_to_30",
+    ]
+
+
+def test_sale_price_keyboard_uses_sale_ranges() -> None:
+    keyboard = _price_keyboard("sale").inline_keyboard
+
+    assert keyboard[0][0].text == "Любая"
+    assert [button.text for button in keyboard[1]] == [
+        "💸 До 5 млн ₽",
+        "🏠 5–10 млн ₽",
+        "✨ 10+ млн ₽",
+    ]
+    assert [button.callback_data for button in keyboard[1]] == [
+        "cfg:price:sale_to_5m",
+        "cfg:price:sale_5_10m",
+        "cfg:price:sale_from_10m",
+    ]
 
 
 def test_show_found_keyboard_uses_user_facing_copy() -> None:
@@ -157,6 +198,15 @@ def test_format_settings_can_show_search_status() -> None:
     assert "Поиск: остановлен" in text
     assert "⏸ Уведомления остановлены" in text
     assert "Новые объявления сейчас не приходят" in text
+
+
+def test_format_settings_for_sale_hides_rent_type() -> None:
+    settings = replace(Settings.from_env(env_file=None), cian_deal_type="sale")
+
+    text = _format_settings(settings)
+
+    assert "🏘 Покупка" in text
+    assert "Аренда" not in text
 
 
 def test_empty_archive_text_explains_next_step() -> None:

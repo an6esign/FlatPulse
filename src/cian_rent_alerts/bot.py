@@ -77,15 +77,21 @@ CITY_OPTIONS = {
     "nn": ("Нижний Новгород", "4885"),
 }
 
-PRICE_OPTIONS = {
-    "none": ("none", "none", "Любой"),
-    "35_45": ("35000", "45000", "35 000 - 45 000"),
-    "45_60": ("45000", "60000", "45 000 - 60 000"),
-    "60_90": ("60000", "90000", "60 000 - 90 000"),
-    "90_130": ("90000", "130000", "90 000 - 130 000"),
-    "to_45": ("none", "45000", "до 45 000"),
-    "to_60": ("none", "60000", "до 60 000"),
+RENT_PRICE_OPTIONS = {
+    "none": ("none", "none", "Любая"),
+    "rent_to_30": ("none", "30000", "💸 До 30 000 ₽"),
+    "rent_30_60": ("30000", "60000", "🏠 30 000 – 60 000 ₽"),
+    "rent_from_60": ("60000", "none", "✨ От 60 000 ₽"),
 }
+
+SALE_PRICE_OPTIONS = {
+    "none": ("none", "none", "Любая"),
+    "sale_to_5m": ("none", "5000000", "💸 До 5 млн ₽"),
+    "sale_5_10m": ("5000000", "10000000", "🏠 5–10 млн ₽"),
+    "sale_from_10m": ("10000000", "none", "✨ 10+ млн ₽"),
+}
+
+PRICE_OPTIONS = {**RENT_PRICE_OPTIONS, **SALE_PRICE_OPTIONS}
 
 ROOM_OPTIONS = {
     "studio": ("studio", "студия"),
@@ -120,6 +126,7 @@ class SettingsBot:
         application.add_handler(CommandHandler("setup", self._authorized(self.setup_command)))
         application.add_handler(CommandHandler("search_url", self._authorized(self.search_url)))
         application.add_handler(CommandHandler("set_city", self._authorized(self.set_city)))
+        application.add_handler(CommandHandler("set_deal", self._authorized(self.set_deal)))
         application.add_handler(CommandHandler("set_region", self._authorized(self.set_region)))
         application.add_handler(CommandHandler("set_price", self._authorized(self.set_price)))
         application.add_handler(CommandHandler("set_rooms", self._authorized(self.set_rooms)))
@@ -387,7 +394,11 @@ class SettingsBot:
             return
         self._update_current_search(update, rooms=rooms, use_generated_url=True)
         self._clear_awaiting(update)
-        await _respond(update, _price_prompt(), _onboarding_price_keyboard())
+        await _respond(
+            update,
+            _price_prompt(),
+            _onboarding_price_keyboard(self.effective_settings_for_update(update).cian_deal_type),
+        )
 
     async def _handle_manual_price(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE, value: str
@@ -404,7 +415,10 @@ class SettingsBot:
             use_generated_url=True,
         )
         self._clear_awaiting(update)
-        await _respond(update, _rent_prompt(), _onboarding_rent_keyboard())
+        if self.effective_settings_for_update(update).cian_deal_type == "sale":
+            await _respond(update, _area_prompt(), _onboarding_area_keyboard())
+        else:
+            await _respond(update, _rent_prompt(), _onboarding_rent_keyboard())
 
     async def _handle_manual_rent(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE, value: str
@@ -592,6 +606,20 @@ class SettingsBot:
         )
         self._record_event(EV_CITY_SELECTED, update, metadata={"source": "command"})
         await self._confirm_settings(update, "Город обновлен.")
+
+    async def set_deal(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if len(context.args) != 1:
+            await _reply(update, "Использование: /set_deal rent или /set_deal sale")
+            return
+        deal_type = context.args[0].strip().lower()
+        if deal_type not in {"rent", "sale"}:
+            await _reply(update, "Тип сделки: rent или sale")
+            return
+        values: dict[str, object] = {"deal_type": deal_type, "use_generated_url": True}
+        if deal_type == "sale":
+            values["rent_type"] = "all"
+        self._update_current_search(update, **values)
+        await self._confirm_settings(update, "Тип сделки обновлен.")
 
     async def set_region(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if len(context.args) != 1 or not context.args[0].isdigit():
@@ -878,15 +906,33 @@ class SettingsBot:
         if action == "cfg:setup":
             self._clear_awaiting(update)
             self._record_event(EV_SETUP_STARTED, update)
-            await _respond(update, _city_prompt(), _onboarding_city_keyboard())
+            await _respond(update, _deal_type_prompt(), _onboarding_deal_type_keyboard())
+            return
+        if action == "onb:step:deal":
+            await _respond(update, _deal_type_prompt(), _onboarding_deal_type_keyboard())
             return
         if action == "onb:step:rooms":
             await _respond(update, _rooms_prompt(), _onboarding_rooms_keyboard())
             return
         if action == "onb:step:price":
-            await _respond(update, _price_prompt(), _onboarding_price_keyboard())
+            await _respond(
+                update,
+                _price_prompt(),
+                _onboarding_price_keyboard(
+                    self.effective_settings_for_update(update).cian_deal_type
+                ),
+            )
             return
         if action == "onb:step:rent":
+            if self.effective_settings_for_update(update).cian_deal_type == "sale":
+                await _respond(
+                    update,
+                    _price_prompt(),
+                    _onboarding_price_keyboard(
+                        self.effective_settings_for_update(update).cian_deal_type
+                    ),
+                )
+                return
             await _respond(update, _rent_prompt(), _onboarding_rent_keyboard())
             return
         if action == "onb:step:area":
@@ -906,6 +952,9 @@ class SettingsBot:
             return
         if action == "cfg:url":
             await self._show_search_url(update)
+            return
+        if action == "cfg:deal":
+            await _respond(update, "Выберите тип сделки:", _deal_type_keyboard())
             return
         if action == "cfg:city":
             await _respond(update, "Выберите город:", _city_keyboard())
@@ -933,15 +982,17 @@ class SettingsBot:
             await _respond(
                 update,
                 "Выберите диапазон цены:",
-                _price_keyboard(),
+                _price_keyboard(self.effective_settings_for_update(update).cian_deal_type),
             )
             return
         if action == "cfg:price_manual":
             self._set_awaiting(update, "price")
             await _respond(
                 update,
-                "Введите цену сообщением.\n\nМожно: Любая, до 60000, 60000-90000, от 90000.",
-                _price_keyboard(),
+                _manual_price_prompt(
+                    self.effective_settings_for_update(update).cian_deal_type
+                ),
+                _price_keyboard(self.effective_settings_for_update(update).cian_deal_type),
             )
             return
         if action == "cfg:rent":
@@ -1045,6 +1096,14 @@ class SettingsBot:
         if action == "cfg:delete":
             await self._delete_current_search(update)
             return
+        if action.startswith("onb:deal:"):
+            deal_type = action.rsplit(":", 1)[1]
+            values: dict[str, object] = {"deal_type": deal_type, "use_generated_url": True}
+            if deal_type == "sale":
+                values["rent_type"] = "all"
+            self._update_current_search(update, **values)
+            await _respond(update, _city_prompt(), _onboarding_city_keyboard())
+            return
         if action.startswith("onb:city:"):
             key = action.rsplit(":", 1)[1]
             city, region_id = CITY_OPTIONS[key]
@@ -1073,7 +1132,13 @@ class SettingsBot:
                 rooms=_rooms_from_command(rooms),
                 use_generated_url=True,
             )
-            await _respond(update, _price_prompt(), _onboarding_price_keyboard())
+            await _respond(
+                update,
+                _price_prompt(),
+                _onboarding_price_keyboard(
+                    self.effective_settings_for_update(update).cian_deal_type
+                ),
+            )
             return
         if action == "onb:rooms_manual":
             self._set_awaiting(update, "rooms")
@@ -1092,14 +1157,21 @@ class SettingsBot:
                 max_price=_optional_int_from_command(max_price),
                 use_generated_url=True,
             )
-            await _respond(update, _rent_prompt(), _onboarding_rent_keyboard())
+            if self.effective_settings_for_update(update).cian_deal_type == "sale":
+                await _respond(update, _area_prompt(), _onboarding_area_keyboard())
+            else:
+                await _respond(update, _rent_prompt(), _onboarding_rent_keyboard())
             return
         if action == "onb:price_manual":
             self._set_awaiting(update, "price")
             await _respond(
                 update,
-                "Введите цену сообщением.\n\nМожно: Любая, до 60000, 60000-90000, от 90000.",
-                _onboarding_price_keyboard(),
+                _manual_price_prompt(
+                    self.effective_settings_for_update(update).cian_deal_type
+                ),
+                _onboarding_price_keyboard(
+                    self.effective_settings_for_update(update).cian_deal_type
+                ),
             )
             return
         if action.startswith("onb:rent:"):
@@ -1189,6 +1261,14 @@ class SettingsBot:
             rent_type = action.rsplit(":", 1)[1]
             self._update_current_search(update, rent_type=rent_type, use_generated_url=True)
             await self._confirm_settings(update, "Тип аренды обновлен.")
+            return
+        if action.startswith("cfg:deal:"):
+            deal_type = action.rsplit(":", 1)[1]
+            values = {"deal_type": deal_type, "use_generated_url": True}
+            if deal_type == "sale":
+                values["rent_type"] = "all"
+            self._update_current_search(update, **values)
+            await self._confirm_settings(update, "Тип сделки обновлен.")
             return
         if action.startswith("cfg:sort:"):
             key = action.rsplit(":", 1)[1]
@@ -1589,6 +1669,7 @@ def _search_values_from_settings(settings: Settings) -> dict[str, object]:
     return {
         "city": settings.cian_city,
         "region_id": settings.cian_region_id,
+        "deal_type": settings.cian_deal_type,
         "rooms": settings.cian_rooms,
         "min_price": settings.cian_min_price,
         "max_price": settings.cian_max_price,
@@ -1605,6 +1686,7 @@ def _default_user_search_values(settings: Settings) -> dict[str, object]:
     return {
         "city": "Москва",
         "region_id": "1",
+        "deal_type": "rent",
         "rooms": ("all",),
         "min_price": None,
         "max_price": None,
@@ -1724,6 +1806,7 @@ def _search_settings_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("✏️ Изменить фильтры", callback_data="cfg:setup")],
+            [InlineKeyboardButton("🏠 Тип сделки", callback_data="cfg:deal")],
             [InlineKeyboardButton("💎 Подписка", callback_data="cfg:subscribe")],
             [
                 InlineKeyboardButton(
@@ -1784,16 +1867,45 @@ def _onboarding_rooms_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def _onboarding_price_keyboard() -> InlineKeyboardMarkup:
+def _price_options_for_deal(deal_type: str) -> dict[str, tuple[str, str, str]]:
+    if deal_type == "sale":
+        return SALE_PRICE_OPTIONS
+    return RENT_PRICE_OPTIONS
+
+
+def _onboarding_price_keyboard(deal_type: str) -> InlineKeyboardMarkup:
+    price_options = _price_options_for_deal(deal_type)
+    price_keys = [key for key in price_options if key != "none"]
+    if deal_type != "sale":
+        return InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("Любая", callback_data="onb:price:none"),
+                    InlineKeyboardButton(
+                        price_options["rent_to_30"][2],
+                        callback_data="onb:price:rent_to_30",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        price_options["rent_30_60"][2],
+                        callback_data="onb:price:rent_30_60",
+                    ),
+                    InlineKeyboardButton(
+                        price_options["rent_from_60"][2],
+                        callback_data="onb:price:rent_from_60",
+                    ),
+                ],
+                [InlineKeyboardButton("Ввести вручную", callback_data="onb:price_manual")],
+                [InlineKeyboardButton("Назад", callback_data="onb:step:rooms")],
+            ]
+        )
     return InlineKeyboardMarkup(
         [
+            [InlineKeyboardButton(price_options["none"][2], callback_data="onb:price:none")],
             [
-                InlineKeyboardButton("Любая", callback_data="onb:price:none"),
-                InlineKeyboardButton("до 60 000", callback_data="onb:price:to_60"),
-            ],
-            [
-                InlineKeyboardButton("60 000 - 90 000", callback_data="onb:price:60_90"),
-                InlineKeyboardButton("90 000 - 130 000", callback_data="onb:price:90_130"),
+                InlineKeyboardButton(price_options[key][2], callback_data=f"onb:price:{key}")
+                for key in price_keys
             ],
             [InlineKeyboardButton("Ввести вручную", callback_data="onb:price_manual")],
             [InlineKeyboardButton("Назад", callback_data="onb:step:rooms")],
@@ -1889,6 +2001,30 @@ def _dev_payment_screen_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def _deal_type_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("🏠 Аренда", callback_data="cfg:deal:rent"),
+                InlineKeyboardButton("🏢 Покупка", callback_data="cfg:deal:sale"),
+            ],
+            [InlineKeyboardButton("Назад", callback_data="cfg:settings")],
+        ]
+    )
+
+
+def _onboarding_deal_type_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("🏠 Аренда", callback_data="onb:deal:rent"),
+                InlineKeyboardButton("🏢 Покупка", callback_data="onb:deal:sale"),
+            ],
+            [InlineKeyboardButton("Назад", callback_data="cfg:menu")],
+        ]
+    )
+
+
 def _city_keyboard() -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(city, callback_data=f"cfg:city:{key}")]
@@ -1916,22 +2052,20 @@ def _rooms_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def _price_keyboard() -> InlineKeyboardMarkup:
+def _price_keyboard(deal_type: str) -> InlineKeyboardMarkup:
+    price_options = _price_options_for_deal(deal_type)
+    price_keys = [key for key in price_options if key != "none"]
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton(label, callback_data=f"cfg:price:{key}")
-                for key, (_min_price, _max_price, label) in list(PRICE_OPTIONS.items())[:2]
-            ],
-            [
-                InlineKeyboardButton(label, callback_data=f"cfg:price:{key}")
-                for key, (_min_price, _max_price, label) in list(PRICE_OPTIONS.items())[2:4]
-            ],
-            [
                 InlineKeyboardButton(
-                    PRICE_OPTIONS["none"][2],
+                    price_options["none"][2],
                     callback_data="cfg:price:none",
                 )
+            ],
+            [
+                InlineKeyboardButton(price_options[key][2], callback_data=f"cfg:price:{key}")
+                for key in price_keys
             ],
             [InlineKeyboardButton("Ввести вручную", callback_data="cfg:price_manual")],
             [InlineKeyboardButton("Назад", callback_data="cfg:menu")],
@@ -2105,7 +2239,7 @@ def _dev_payment_screen_text(settings: Settings) -> str:
             "FlatPulse",
             "",
             "Услуга:",
-            "Подписка на Telegram-бота для отслеживания новых объявлений о сдаче квартир на ЦИАН.",
+            "Подписка на Telegram-бота для отслеживания новых объявлений о квартирах на ЦИАН.",
             "",
             f"Стоимость: {settings.subscription_price_rub} ₽ в месяц.",
             "Оплата вручную, без автосписаний.",
@@ -2117,7 +2251,7 @@ def _help_text() -> str:
     return "\n".join(
         [
             "Как это работает:",
-            "1. Настройте город, комнаты, бюджет, тип аренды и область поиска.",
+            "1. Настройте тип сделки, город, комнаты, бюджет и область поиска.",
             "2. FlatPulse запомнит текущую выдачу ЦИАН.",
             "3. Дальше бот будет присылать только новые подходящие квартиры.",
             "",
@@ -2139,15 +2273,16 @@ def _format_settings(
     lines = [status_line]
     if access_status is not None:
         lines.append(access_status)
-    lines.extend(
-        [
-            f"📍 {settings.cian_city}",
-            f"🏠 {_format_rooms_for_sentence(settings.cian_rooms)}",
-            f"💰 {_format_price_for_sentence(settings.cian_min_price, settings.cian_max_price)}",
-            f"📅 {_format_rent_for_sentence(settings.cian_rent_type)}",
-            f"🗺 {_format_area(settings.cian_polygon, settings.cian_area_label)}",
-        ]
-    )
+    filter_lines = [
+        f"🏘 {_format_deal_type_for_sentence(settings.cian_deal_type)}",
+        f"📍 {settings.cian_city}",
+        f"🏠 {_format_rooms_for_sentence(settings.cian_rooms)}",
+        f"💰 {_format_price_for_sentence(settings.cian_min_price, settings.cian_max_price)}",
+    ]
+    if settings.cian_deal_type == "rent":
+        filter_lines.append(f"📅 {_format_rent_for_sentence(settings.cian_rent_type)}")
+    filter_lines.append(f"🗺 {_format_area(settings.cian_polygon, settings.cian_area_label)}")
+    lines.extend(filter_lines)
     if found_count is not None:
         lines.append(f"🔥 Сейчас найдено: {found_count} квартир")
     if status == "остановлен":
@@ -2180,10 +2315,15 @@ def _search_configured_text(settings: Settings, *, found: object) -> str:
         [
             "✅ Поиск настроен",
             "",
+            f"🏘 Сделка: {_format_deal_type(settings.cian_deal_type)}",
             f"📍 Город: {settings.cian_city}",
             f"🏠 Комнаты: {_format_rooms(settings.cian_rooms)}",
             f"💰 Бюджет: {_format_price(settings.cian_min_price, settings.cian_max_price)}",
-            f"📅 Аренда: {_format_rent(settings.cian_rent_type)}",
+            *(
+                [f"📅 Аренда: {_format_rent(settings.cian_rent_type)}"]
+                if settings.cian_deal_type == "rent"
+                else []
+            ),
             "",
             f"🔥 Уже найдено: {found} квартир",
             "",
@@ -2206,8 +2346,18 @@ def _price_prompt() -> str:
     return "💰 Какой бюджет?"
 
 
+def _manual_price_prompt(deal_type: str) -> str:
+    if deal_type == "sale":
+        return "Введите цену сообщением.\n\nМожно: Любая, до 5000000, 5000000-10000000, от 10000000."
+    return "Введите цену сообщением.\n\nМожно: Любая, до 30000, 30000-60000, от 60000."
+
+
 def _rent_prompt() -> str:
     return "📅 Какая аренда интересует?"
+
+
+def _deal_type_prompt() -> str:
+    return "Что будем искать?"
 
 
 def _area_prompt() -> str:
@@ -2383,15 +2533,19 @@ def _format_admin_searches(searches: list[dict[str, object]]) -> str:
     for search in searches:
         username = search.get("username") or "-"
         status = "active" if search.get("is_active") else "stopped"
+        deal_type = str(search.get("deal_type") or "rent")
         cooldown_until = _active_cooldown_until(search)
         if cooldown_until is not None:
             status = f"cooldown until {_format_timestamp(cooldown_until)}"
-        lines.append(
+        line = (
             f"#{search['id']} chat={search['telegram_chat_id']} @{username} {status} "
+            f"deal={_format_deal_type(deal_type)} "
             f"{search['city']} rooms={_format_rooms(_rooms_from_db(search.get('rooms')))} "
             f"price={_format_price(_optional_int_from_db(search.get('min_price')), _optional_int_from_db(search.get('max_price')))} "
-            f"rent={_format_rent(str(search['rent_type']))}"
         )
+        if deal_type == "rent":
+            line += f"rent={_format_rent(str(search['rent_type']))}"
+        lines.append(line)
     return "\n".join(lines)
 
 
@@ -2612,6 +2766,14 @@ def _format_rent(value: str) -> str:
     return {"long": "долгосрочная", "short": "посуточная", "all": "Любой"}.get(value, value)
 
 
+def _format_deal_type(value: str) -> str:
+    return {"rent": "аренда", "sale": "покупка"}.get(value, value)
+
+
+def _format_deal_type_for_sentence(value: str) -> str:
+    return {"rent": "Аренда", "sale": "Покупка"}.get(value, value)
+
+
 def _format_rent_for_sentence(value: str) -> str:
     return {
         "long": "Долгосрочная аренда",
@@ -2701,7 +2863,7 @@ def _parse_manual_price(value: str) -> tuple[int | None, int | None]:
     if match:
         return int(match.group(1)), int(match.group(2))
 
-    raise ConfigError("Цена: Любая, до 60000, 60000-90000 или от 90000.")
+    raise ConfigError("Цена: Любая, до 30000, 30000-60000, от 60000 или похожий диапазон.")
 
 
 def _parse_manual_rent(value: str) -> str:

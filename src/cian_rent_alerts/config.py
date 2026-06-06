@@ -91,6 +91,7 @@ def _as_optional_path(value: str | None) -> Path | None:
 class Settings:
     cian_search_url: str | None
     cian_use_generated_url: bool
+    cian_deal_type: str
     cian_city: str
     cian_region_id: str | None
     cian_rooms: tuple[str, ...]
@@ -154,6 +155,7 @@ class Settings:
         return cls(
             cian_search_url=cian_search_url or None,
             cian_use_generated_url=_as_bool(os.getenv("CIAN_USE_GENERATED_URL"), True),
+            cian_deal_type=os.getenv("CIAN_DEAL_TYPE", "rent").strip().lower(),
             cian_city=os.getenv("CIAN_CITY", "Казань").strip(),
             cian_region_id=os.getenv("CIAN_REGION_ID") or None,
             cian_rooms=_as_rooms(os.getenv("CIAN_ROOMS")),
@@ -254,7 +256,13 @@ class Settings:
                 overrides[key] = value or None
             elif key == "cian_use_generated_url":
                 overrides[key] = _as_bool(value, True)
-            elif key in {"cian_city", "cian_region_id", "cian_rent_type", "cian_sort_by"}:
+            elif key in {
+                "cian_city",
+                "cian_region_id",
+                "cian_deal_type",
+                "cian_rent_type",
+                "cian_sort_by",
+            }:
                 stripped = value.strip()
                 overrides[key] = stripped or None if key == "cian_region_id" else stripped
             elif key == "cian_rooms":

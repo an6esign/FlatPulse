@@ -56,6 +56,28 @@ def test_build_cian_search_url_with_any_rent_type() -> None:
     assert "room1=1" not in url
 
 
+def test_build_cian_search_url_for_sale() -> None:
+    url = build_cian_search_url(
+        city="Москва",
+        region_id=None,
+        rooms=("1", "2"),
+        min_price=10_000_000,
+        max_price=20_000_000,
+        rent_type="all",
+        sort_by="creation_date_from_newer_to_older",
+        deal_type="sale",
+    )
+
+    assert "deal_type=sale" in url
+    assert "offer_type=flat" in url
+    assert "type=4" not in url
+    assert "type=2" not in url
+    assert "room1=1" in url
+    assert "room2=1" in url
+    assert "minprice=10000000" in url
+    assert "maxprice=20000000" in url
+
+
 def test_build_cian_search_url_uses_moscow_host() -> None:
     url = build_cian_search_url(
         city="Москва",
@@ -259,6 +281,37 @@ def test_parse_listing_from_cian_card() -> None:
     assert listings[0].url == "https://www.cian.ru/rent/flat/987654321/"
     assert listings[0].price == 42000
     assert listings[0].address == "Казань, ул. Пушкина, 10"
+
+
+def test_parse_sale_listing_from_cian_card() -> None:
+    html = """
+    <html>
+      <body>
+        <article data-name="CardComponent">
+          <div data-name="LinkArea">
+            <a href="https://www.cian.ru/sale/flat/123456789/">2-комн. квартира</a>
+            <div data-name="GeneralInfoSectionRowComponent">2-комн. квартира, 54 м²</div>
+            <span data-mark="MainPrice">15 000 000 ₽</span>
+          </div>
+        </article>
+      </body>
+    </html>
+    """
+    scraper = RequestsCianScraper(
+        ScraperConfig(
+            search_url="https://www.cian.ru",
+            user_agent="test",
+            timeout_seconds=1,
+            limit=10,
+        )
+    )
+
+    listings = scraper.parse(html)
+
+    assert len(listings) == 1
+    assert listings[0].cian_id == "123456789"
+    assert listings[0].url == "https://www.cian.ru/sale/flat/123456789/"
+    assert listings[0].price == 15000000
 
 
 def test_parse_listing_publish_label_from_cian_card() -> None:

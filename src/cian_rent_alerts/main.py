@@ -178,6 +178,7 @@ def start_scheduler(settings: Settings) -> BackgroundScheduler:
         id="cian_check",
         max_instances=1,
         coalesce=True,
+        jitter=settings.check_interval_jitter_seconds or None,
     )
     scheduler.add_job(
         run_monitoring,
@@ -189,7 +190,11 @@ def start_scheduler(settings: Settings) -> BackgroundScheduler:
         coalesce=True,
     )
 
-    logging.info("Starting scheduler, interval=%ss", settings.check_interval_seconds)
+    logging.info(
+        "Starting scheduler, interval=%ss jitter=%ss",
+        settings.check_interval_seconds,
+        settings.check_interval_jitter_seconds,
+    )
     run_check(settings)
     run_monitoring(settings)
     scheduler.start()

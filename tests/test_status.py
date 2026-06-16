@@ -155,8 +155,11 @@ def test_admin_monitoring_counts_and_formatters(tmp_path: Path) -> None:
         telegram_retry_attempts=3,
         telegram_retry_backoff_seconds=2,
         search_check_delay_seconds=5,
+        search_check_delay_jitter_seconds=20,
         manual_check_cooldown_seconds=180,
         callback_cooldown_seconds=2,
+        check_interval_jitter_seconds=90,
+        parser_captcha_cooldown_seconds=10800,
         parser_problem_cooldown_seconds=3600,
         parser_network_cooldown_seconds=900,
     )
@@ -176,9 +179,11 @@ def test_admin_monitoring_counts_and_formatters(tmp_path: Path) -> None:
     assert "partial=1" in health_text
     assert "Parser: requests+playwright_fallback, retry=3 backoff=2 sec" in health_text
     assert "Telegram: rate_limit=0.4 sec retry=3 backoff=2 sec" in health_text
-    assert "search_delay=5 sec" in health_text
+    assert "Interval: 10 min jitter=90 sec" in health_text
+    assert "search_delay=5 sec jitter=20 sec" in health_text
     assert "manual_check=3 min" in health_text
     assert "callback=2 sec" in health_text
+    assert "captcha_cooldown=180 min" in health_text
     assert "problem_cooldown=60 min" in health_text
     assert "network_cooldown=15 min" in health_text
     assert "Admin health" in report_text

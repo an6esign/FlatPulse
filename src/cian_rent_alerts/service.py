@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import random
 import threading
 import time
 import hashlib
@@ -754,7 +755,9 @@ def _record_check_error_event(
 
 
 def _cooldown_until_for_error(settings: Settings, error_type: str) -> str | None:
-    if error_type in {"captcha", "empty_parse"}:
+    if error_type == "captcha":
+        seconds = settings.parser_captcha_cooldown_seconds
+    elif error_type == "empty_parse":
         seconds = settings.parser_problem_cooldown_seconds
     elif error_type == "network":
         seconds = settings.parser_network_cooldown_seconds
@@ -780,11 +783,15 @@ def _delay_between_searches(
     if settings.search_check_delay_seconds <= 0:
         return
 
+    delay_seconds = settings.search_check_delay_seconds
+    if settings.search_check_delay_jitter_seconds > 0:
+        delay_seconds += random.uniform(0, settings.search_check_delay_jitter_seconds)
+
     logger.info(
-        "Waiting %s seconds before next search check",
-        settings.search_check_delay_seconds,
+        "Waiting %.1f seconds before next search check",
+        delay_seconds,
     )
-    time.sleep(settings.search_check_delay_seconds)
+    time.sleep(delay_seconds)
 
 
 def _delay_after_telegram_send(

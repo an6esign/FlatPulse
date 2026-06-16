@@ -2374,7 +2374,8 @@ def _format_admin_status(store: ListingStore, settings: Settings) -> str:
     cooldown_searches = store.cooldown_searches_count()
     lines = [
         "Admin status",
-        f"Interval: {_format_interval(settings.check_interval_seconds)}",
+        f"Interval: {_format_interval(settings.check_interval_seconds)} "
+        f"jitter={_format_interval(settings.check_interval_jitter_seconds)}",
         f"Dry run: {'yes' if settings.dry_run else 'no'}",
         f"Playwright: {'yes' if settings.use_playwright else 'no'}",
         f"Users: {store.users_count()} total, {store.users_count(active=True)} active",
@@ -2427,7 +2428,8 @@ def _format_admin_health(store: ListingStore, settings: Settings) -> str:
         f"Health: {health}",
         "DB: ok",
         f"Schema: {schema_version}",
-        f"Interval: {_format_interval(settings.check_interval_seconds)}",
+        f"Interval: {_format_interval(settings.check_interval_seconds)} "
+        f"jitter={_format_interval(settings.check_interval_jitter_seconds)}",
         f"Users: {users_total} total, {users_active} active",
         f"Searches: {searches_total} total, {searches_active} active, {cooldown_searches} cooldown",
         f"Parser: {_format_parser_mode(settings)}, retry={settings.parser_retry_attempts} "
@@ -2436,8 +2438,10 @@ def _format_admin_health(store: ListingStore, settings: Settings) -> str:
         f"retry={settings.telegram_retry_attempts} "
         f"backoff={_format_interval(settings.telegram_retry_backoff_seconds)}",
         f"Limits: search_delay={_format_interval(settings.search_check_delay_seconds)} "
+        f"jitter={_format_interval(settings.search_check_delay_jitter_seconds)} "
         f"manual_check={_format_interval(settings.manual_check_cooldown_seconds)} "
         f"callback={_format_interval(settings.callback_cooldown_seconds)} "
+        f"captcha_cooldown={_format_interval(settings.parser_captcha_cooldown_seconds)} "
         f"problem_cooldown={_format_interval(settings.parser_problem_cooldown_seconds)} "
         f"network_cooldown={_format_interval(settings.parser_network_cooldown_seconds)}",
         f"Last 24h: runs={daily_summary['runs']} partial={daily_summary['partial_runs']} "

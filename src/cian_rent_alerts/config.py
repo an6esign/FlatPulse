@@ -111,7 +111,9 @@ class Settings:
     database_path: Path
     parser_debug_dir: Path | None
     check_interval_seconds: int
+    check_interval_jitter_seconds: int
     search_check_delay_seconds: int
+    search_check_delay_jitter_seconds: int
     telegram_send_delay_seconds: int
     listing_limit: int
     listing_max_age_days: int
@@ -119,6 +121,7 @@ class Settings:
     request_timeout_seconds: int
     parser_retry_attempts: int
     parser_retry_backoff_seconds: int
+    parser_captcha_cooldown_seconds: int
     parser_problem_cooldown_seconds: int
     parser_network_cooldown_seconds: int
     user_agent: str
@@ -177,7 +180,11 @@ class Settings:
             database_path=Path(os.getenv("DATABASE_PATH", "data/listings.sqlite3")),
             parser_debug_dir=_as_optional_path(os.getenv("PARSER_DEBUG_DIR")),
             check_interval_seconds=max(_as_int("CHECK_INTERVAL_SECONDS", 600), 60),
+            check_interval_jitter_seconds=max(_as_int("CHECK_INTERVAL_JITTER_SECONDS", 90), 0),
             search_check_delay_seconds=max(_as_int("SEARCH_CHECK_DELAY_SECONDS", 5), 0),
+            search_check_delay_jitter_seconds=max(
+                _as_int("SEARCH_CHECK_DELAY_JITTER_SECONDS", 20), 0
+            ),
             telegram_send_delay_seconds=max(_as_int("TELEGRAM_SEND_DELAY_SECONDS", 1), 0),
             listing_limit=max(_as_int("LISTING_LIMIT", 50), 1),
             listing_max_age_days=max(_as_int("LISTING_MAX_AGE_DAYS", 2), 0),
@@ -185,6 +192,9 @@ class Settings:
             request_timeout_seconds=max(_as_int("REQUEST_TIMEOUT_SECONDS", 20), 1),
             parser_retry_attempts=max(_as_int("PARSER_RETRY_ATTEMPTS", 2), 1),
             parser_retry_backoff_seconds=max(_as_int("PARSER_RETRY_BACKOFF_SECONDS", 2), 0),
+            parser_captcha_cooldown_seconds=max(
+                _as_int("PARSER_CAPTCHA_COOLDOWN_SECONDS", 10800), 0
+            ),
             parser_problem_cooldown_seconds=max(
                 _as_int("PARSER_PROBLEM_COOLDOWN_SECONDS", 3600), 0
             ),

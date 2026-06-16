@@ -212,6 +212,7 @@ def test_check_waits_between_multiple_searches(tmp_path: Path, monkeypatch) -> N
         database_path=tmp_path / "test.sqlite3",
         dry_run=True,
         search_check_delay_seconds=5,
+        search_check_delay_jitter_seconds=0,
     )
     store = ListingStore(settings.database_path)
     store.init()
@@ -630,6 +631,9 @@ def test_failed_search_gets_cooldown_and_is_skipped_next_run(
         Settings.from_env(env_file=None),
         database_path=tmp_path / "test.sqlite3",
         dry_run=True,
+        search_check_delay_seconds=0,
+        search_check_delay_jitter_seconds=0,
+        parser_captcha_cooldown_seconds=10800,
         parser_problem_cooldown_seconds=3600,
         parser_network_cooldown_seconds=900,
     )
@@ -661,6 +665,8 @@ def test_failed_search_gets_cooldown_and_is_skipped_next_run(
     assert search["last_error_type"] == "captcha"
     assert search["last_error_at"] is not None
     assert search["cooldown_until"] is not None
+    cooldown_until = datetime.fromisoformat(str(search["cooldown_until"]))
+    assert cooldown_until - datetime.now(UTC) > timedelta(hours=2, minutes=50)
     assert store.cooldown_searches_count() == 1
     assert store.active_searches() == []
     assert store.analytics_events_summary_since("2000-01-01T00:00:00+00:00")[EV_CAPTCHA_ERROR] == 1

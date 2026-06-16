@@ -728,7 +728,7 @@ class ListingStore:
     def recent_users(self, limit: int = 10) -> list[dict[str, object]]:
         with self.engine.begin() as conn:
             rows = conn.execute(
-                select(users_table).order_by(users_table.c.last_seen_at.desc()).limit(limit)
+                select(users_table).order_by(users_table.c.first_seen_at.desc()).limit(limit)
             ).fetchall()
         return [dict(row._mapping) for row in rows]
 

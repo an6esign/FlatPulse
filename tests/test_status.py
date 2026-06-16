@@ -1,6 +1,8 @@
 from pathlib import Path
 from dataclasses import replace
 
+from sqlalchemy import update
+
 from cian_rent_alerts.bot import (
     _format_admin_health,
     _format_admin_metrics,
@@ -12,7 +14,7 @@ from cian_rent_alerts.bot import (
     _format_check_runs,
 )
 from cian_rent_alerts.config import Settings
-from cian_rent_alerts.db import ListingStore
+from cian_rent_alerts.db import ListingStore, users_table
 from cian_rent_alerts.analytics import (
     EV_MANUAL_CHECK,
     EV_MANUAL_CHECK_BLOCKED,
@@ -192,6 +194,39 @@ def test_admin_monitoring_counts_and_formatters(tmp_path: Path) -> None:
     assert "Admin payments" in report_text
     assert "Последние проверки" in report_text
     assert "Последние ошибки" in report_text
+
+
+def test_recent_users_orders_by_first_seen(tmp_path: Path) -> None:
+    store = ListingStore(tmp_path / "test.sqlite3")
+    store.init()
+    old_user_id = store.upsert_user(telegram_chat_id="100", username="old")
+    new_user_id = store.upsert_user(telegram_chat_id="200", username="new")
+
+    with store.engine.begin() as conn:
+        conn.execute(
+            update(users_table)
+            .where(users_table.c.id == old_user_id)
+            .values(
+                first_seen_at="2026-01-01T00:00:00+00:00",
+                last_seen_at="2026-06-17T00:00:00+00:00",
+            )
+        )
+        conn.execute(
+            update(users_table)
+            .where(users_table.c.id == new_user_id)
+            .values(
+                first_seen_at="2026-06-01T00:00:00+00:00",
+                last_seen_at="2026-06-01T00:00:00+00:00",
+            )
+        )
+
+    users = store.recent_users(limit=2)
+    text = _format_admin_users(users)
+
+    assert users[0]["telegram_chat_id"] == "200"
+    assert "@new" in text
+    assert "first=" in text
+    assert "last=" in text
 
 
 def test_format_admin_metrics(tmp_path: Path) -> None:

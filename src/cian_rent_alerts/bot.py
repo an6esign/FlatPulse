@@ -2524,7 +2524,8 @@ def _format_admin_users(users: list[dict[str, object]]) -> str:
         admin = " admin" if user.get("is_admin") else ""
         lines.append(
             f"#{user['id']} chat={user['telegram_chat_id']} @{username} "
-            f"{active}{admin} last={_format_timestamp(user.get('last_seen_at'))}"
+            f"{active}{admin} first={_format_timestamp(user.get('first_seen_at'))} "
+            f"last={_format_timestamp(user.get('last_seen_at'))}"
         )
     return "\n".join(lines)
 

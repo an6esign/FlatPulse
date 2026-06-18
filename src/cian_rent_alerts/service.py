@@ -76,6 +76,9 @@ def build_scraper_config(settings: Settings) -> ScraperConfig:
         timeout_seconds=settings.request_timeout_seconds,
         limit=settings.listing_limit,
         debug_dir=settings.parser_debug_dir,
+        proxy_server=settings.cian_proxy_server,
+        proxy_username=settings.cian_proxy_username,
+        proxy_password=settings.cian_proxy_password,
     )
 
 

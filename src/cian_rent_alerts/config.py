@@ -125,6 +125,9 @@ class Settings:
     parser_problem_cooldown_seconds: int
     parser_network_cooldown_seconds: int
     user_agent: str
+    cian_proxy_server: str | None
+    cian_proxy_username: str | None
+    cian_proxy_password: str | None
     use_playwright: bool
     playwright_fallback: bool
     playwright_headless: bool
@@ -204,6 +207,9 @@ class Settings:
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36",
             ),
+            cian_proxy_server=os.getenv("CIAN_PROXY_SERVER") or None,
+            cian_proxy_username=os.getenv("CIAN_PROXY_USERNAME") or None,
+            cian_proxy_password=os.getenv("CIAN_PROXY_PASSWORD") or None,
             use_playwright=_as_bool(os.getenv("USE_PLAYWRIGHT"), False),
             playwright_fallback=_as_bool(os.getenv("PLAYWRIGHT_FALLBACK"), False),
             playwright_headless=_as_bool(os.getenv("PLAYWRIGHT_HEADLESS"), True),

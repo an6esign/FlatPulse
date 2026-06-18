@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 
 import cloudscraper
 import requests
@@ -36,6 +36,9 @@ class ScraperConfig:
     timeout_seconds: int
     limit: int
     debug_dir: Path | None = None
+    proxy_server: str | None = None
+    proxy_username: str | None = None
+    proxy_password: str | None = None
 
 
 class CianScraperError(RuntimeError):
@@ -161,6 +164,9 @@ class RequestsCianScraper(CianScraper):
                 "Cache-Control": "no-cache",
             }
         )
+        proxy_url = _requests_proxy_url(config)
+        if proxy_url is not None:
+            self.session.proxies.update({"http": proxy_url, "https": proxy_url})
 
     def fetch(self) -> str:
         try:
@@ -170,7 +176,8 @@ class RequestsCianScraper(CianScraper):
             )
             response.raise_for_status()
         except requests.RequestException as exc:
-            raise NetworkFetchError(f"Failed to fetch CIAN search page: {exc}") from exc
+            details = _redact_proxy_secrets(str(exc), self.config)
+            raise NetworkFetchError(f"Failed to fetch CIAN search page: {details}") from exc
         if _looks_like_access_check(response.text):
             _save_debug_html(
                 response.text,
@@ -196,13 +203,20 @@ class PlaywrightCianScraper(CianScraper):
                 "and then run: playwright install chromium"
             ) from exc
 
-        with sync_playwright() as playwright:
-            browser = playwright.chromium.launch(headless=self.headless)
-            page = browser.new_page(user_agent=self.config.user_agent, locale="ru-RU")
-            page.goto(self.config.search_url, wait_until="domcontentloaded", timeout=60_000)
-            page.wait_for_timeout(5_000)
-            html = page.content()
-            browser.close()
+        try:
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch(
+                    headless=self.headless,
+                    proxy=_playwright_proxy(self.config),
+                )
+                page = browser.new_page(user_agent=self.config.user_agent, locale="ru-RU")
+                page.goto(self.config.search_url, wait_until="domcontentloaded", timeout=60_000)
+                page.wait_for_timeout(5_000)
+                html = page.content()
+                browser.close()
+        except Exception as exc:
+            details = _redact_proxy_secrets(str(exc), self.config)
+            raise NetworkFetchError(f"Failed to fetch CIAN with Playwright: {details}") from exc
         if _looks_like_access_check(html):
             _save_debug_html(
                 html,
@@ -212,6 +226,53 @@ class PlaywrightCianScraper(CianScraper):
             )
             raise CaptchaError(_CAPTCHA_MESSAGE)
         return html
+
+
+def _requests_proxy_url(config: ScraperConfig) -> str | None:
+    if not config.proxy_server:
+        return None
+    if not config.proxy_username and not config.proxy_password:
+        return config.proxy_server
+
+    parsed = urlsplit(config.proxy_server)
+    if not parsed.scheme or not parsed.hostname:
+        raise ValueError("CIAN_PROXY_SERVER must include a scheme and host")
+
+    username = quote(config.proxy_username or "", safe="")
+    password = quote(config.proxy_password or "", safe="")
+    credentials = username
+    if config.proxy_password is not None:
+        credentials = f"{credentials}:{password}"
+
+    host = parsed.hostname
+    if ":" in host:
+        host = f"[{host}]"
+    if parsed.port is not None:
+        host = f"{host}:{parsed.port}"
+
+    return urlunsplit((parsed.scheme, f"{credentials}@{host}", parsed.path, parsed.query, ""))
+
+
+def _playwright_proxy(config: ScraperConfig) -> dict[str, str] | None:
+    if not config.proxy_server:
+        return None
+
+    proxy = {"server": config.proxy_server}
+    if config.proxy_username:
+        proxy["username"] = config.proxy_username
+    if config.proxy_password:
+        proxy["password"] = config.proxy_password
+    return proxy
+
+
+def _redact_proxy_secrets(message: str, config: ScraperConfig) -> str:
+    redacted = message
+    for secret in (config.proxy_username, config.proxy_password):
+        if not secret:
+            continue
+        redacted = redacted.replace(secret, "***")
+        redacted = redacted.replace(quote(secret, safe=""), "***")
+    return redacted
 
 
 def scrape(scraper: CianScraper, limit: int) -> list[Listing]:

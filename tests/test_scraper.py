@@ -7,6 +7,8 @@ from cian_rent_alerts.scraper import (
     EmptyParseError,
     RequestsCianScraper,
     ScraperConfig,
+    _playwright_proxy,
+    _redact_proxy_secrets,
     scrape,
 )
 from cian_rent_alerts.cian_url import build_cian_search_url, extract_polygon
@@ -161,6 +163,34 @@ def test_parse_listing_from_html_link() -> None:
     assert listings[0].cian_id == "123456789"
     assert listings[0].price == 85000
     assert listings[0].rooms == "2-комн."
+
+
+def test_scrapers_configure_authenticated_proxy_without_leaking_secrets() -> None:
+    config = ScraperConfig(
+        search_url="https://www.cian.ru",
+        user_agent="test",
+        timeout_seconds=1,
+        limit=10,
+        proxy_server="http://proxy.example.com:10029",
+        proxy_username="proxy-user",
+        proxy_password="p@ss:word",
+    )
+
+    scraper = RequestsCianScraper(config)
+
+    assert scraper.session.proxies == {
+        "http": "http://proxy-user:p%40ss%3Aword@proxy.example.com:10029",
+        "https": "http://proxy-user:p%40ss%3Aword@proxy.example.com:10029",
+    }
+    assert _playwright_proxy(config) == {
+        "server": "http://proxy.example.com:10029",
+        "username": "proxy-user",
+        "password": "p@ss:word",
+    }
+    assert (
+        _redact_proxy_secrets("proxy-user p@ss:word p%40ss%3Aword", config)
+        == "*** *** ***"
+    )
 
 
 def test_scrape_raises_empty_parse_and_saves_debug_html(tmp_path) -> None:

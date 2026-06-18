@@ -199,7 +199,8 @@ class PlaywrightCianScraper(CianScraper):
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(headless=self.headless)
             page = browser.new_page(user_agent=self.config.user_agent, locale="ru-RU")
-            page.goto(self.config.search_url, wait_until="networkidle", timeout=60_000)
+            page.goto(self.config.search_url, wait_until="domcontentloaded", timeout=60_000)
+            page.wait_for_timeout(5_000)
             html = page.content()
             browser.close()
         if _looks_like_access_check(html):

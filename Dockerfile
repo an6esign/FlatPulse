@@ -11,7 +11,8 @@ COPY alembic.ini ./
 COPY migrations ./migrations
 COPY scripts ./scripts
 
-RUN pip install --no-cache-dir . \
+RUN pip install --no-cache-dir '.[playwright]' \
+    && playwright install --with-deps chromium \
     && chmod +x /app/scripts/docker-entrypoint.sh
 
 VOLUME ["/app/data"]
